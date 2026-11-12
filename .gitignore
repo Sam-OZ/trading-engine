@@ -1,0 +1,22 @@
+# Secrets: never commit. Keys live in GCP Secret Manager.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# Runtime data
+data/
+*.db
+*.sqlite
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+dist/
+build/
+*.egg-info/
+.DS_Store

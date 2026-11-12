@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tradeengine"
+version = "0.1.0"
+description = "Autonomous Forex and crypto trading engine (demo accounts only)"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "httpx>=0.27",
+  "websockets>=13",
+  "sqlalchemy[asyncio]>=2.0.30",
+  "aiosqlite>=0.20",
+  "asyncpg>=0.29",
+  "pydantic>=2.7",
+  "pydantic-settings>=2.3",
+  "tzdata>=2024.1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+  "pytest-asyncio>=0.23",
+  "respx>=0.21",
+]
+
+[project.scripts]
+tradeengine = "tradeengine.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tradeengine"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+pythonpath = ["src"]

@@ -1,0 +1,39 @@
+# Postgres + engine. Secrets are passed through from the shell that runs
+# `docker compose` (e.g. via scripts/with-secrets.sh); none are stored here.
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: trading
+      POSTGRES_USER: trading
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me-on-the-server}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trading -d trading"]
+      interval: 10s
+      retries: 5
+
+  engine:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      TRADING_MODE: demo
+      DATABASE_URL: postgresql+asyncpg://trading:${POSTGRES_PASSWORD:-change-me-on-the-server}@db:5432/trading
+      CAPITAL_API_KEY: ${CAPITAL_API_KEY:-}
+      CAPITAL_IDENTIFIER: ${CAPITAL_IDENTIFIER:-}
+      CAPITAL_API_PASSWORD: ${CAPITAL_API_PASSWORD:-}
+      BINANCE_API_KEY: ${BINANCE_API_KEY:-}
+      BINANCE_API_SECRET: ${BINANCE_API_SECRET:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+    volumes:
+      - enginedata:/app/data
+
+volumes:
+  pgdata:
+  enginedata:
