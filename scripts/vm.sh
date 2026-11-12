@@ -51,7 +51,17 @@ cmd_create() {
     g storage buckets update "gs://$BUCKET" --lifecycle-file=/tmp/te-lifecycle.json
     rm -f /tmp/te-lifecycle.json
   fi
-  g storage buckets add-iam-policy-binding "gs://$BUCKET" --member="serviceAccount:$SA" --role=roles/storage.objectCreator >/dev/null
+  # A brand-new service account takes up to a minute to become visible to Cloud Storage: retry.
+  for i in $(seq 1 12); do
+    if g storage buckets add-iam-policy-binding "gs://$BUCKET" --member="serviceAccount:$SA" \
+         --role=roles/storage.objectCreator >/dev/null 2>/tmp/te-bind.err; then
+      break
+    fi
+    if [ "$i" -eq 12 ]; then cat /tmp/te-bind.err >&2; rm -f /tmp/te-bind.err; exit 1; fi
+    echo "   service account not visible yet; retrying in 10 s ($i/12)"
+    sleep 10
+  done
+  rm -f /tmp/te-bind.err
   g compute networks describe default >/dev/null 2>&1 || g compute networks create default --subnet-mode=auto
   echo "== Firewall: SSH only from Google's IAP range; no other inbound =="
   g compute firewall-rules describe allow-ssh-from-iap >/dev/null 2>&1 \
@@ -73,6 +83,10 @@ cmd_create() {
 }
 
 cmd_deploy() {
+  if ! g compute instances describe "$VM" --zone="$ZONE" >/dev/null 2>&1; then
+    echo "The server $VM does not exist yet. Run ./scripts/vm.sh create first (it must finish without an error)." >&2
+    exit 1
+  fi
   if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
     echo "You have uncommitted changes; only COMMITTED code is deployed. Commit first (or stash) and run again." >&2
     exit 1
