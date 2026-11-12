@@ -80,6 +80,17 @@ START_EQUITY = 10_000.0  # per venue; percentages are what matter
 
 
 # ------------------------------------------------------------------ data
+class IncompleteData(RuntimeError):
+    """The pre-registered basket is not all there: a run on part of it would not be the planned test."""
+
+
+def require_complete(notes: list[str], data: dict) -> None:
+    missing = [n for n in notes if not any(n.startswith(f"{s}:") for s in data) or "WARNING" in n]
+    if missing:
+        raise IncompleteData("history missing or short for: " + "; ".join(missing)
+                             + ". Run `./scripts/with-secrets.sh uv run tradeengine download-all --from 2013-01-01` first.")
+
+
 def load_round2_data(data_dir: Path, instruments: dict, until: pd.Timestamp) -> tuple[dict, list[str]]:
     """symbol -> (H1 frame cut to [data start, until), Instrument), plus one note per symbol."""
     data, notes = {}, []
@@ -392,6 +403,7 @@ def _run_payload(run: StrategyRun) -> dict:
 def run_dev(data_dir: Path, settings, instruments: dict, strategies: dict | None = None, progress=print):
     strategies = strategies or ROUND2_STRATEGIES
     data, notes = load_round2_data(data_dir, instruments, DEV_END)
+    require_complete(notes, data)
     rates = rate_book(data)
     runs, verdicts = [], {}
     for strat in strategies.values():
@@ -406,6 +418,7 @@ def run_holdout(data_dir: Path, settings, instruments: dict, dev: dict, strategi
     """Holdout for the strategies that passed development, on their frozen baskets."""
     strategies = strategies or ROUND2_STRATEGIES
     data, notes = load_round2_data(data_dir, instruments, HOLDOUT_END)
+    require_complete(notes, data)
     rates = rate_book(data)
     runs, verdicts = [], {}
     for name, d in dev["strategies"].items():

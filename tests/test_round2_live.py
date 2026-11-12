@@ -279,7 +279,40 @@ async def test_monthly_hourly_files_with_fallback_to_minutes_and_minutes_for_the
     assert len(feb) == 29  # leap year: one bar per day built from minute files
     mar = [b for b in bars if b.open_time.month == 3]
     assert [b.open_time.day for b in mar] == [1, 2]  # the current month from minutes, nothing after "today"
-    assert stats == {"monthly": 1, "from_minutes": 2}
+    assert stats == {"monthly": 1, "from_minutes": 2, "monthly_problem": "monthly file not found (404)"}
+
+
+@respx.mock
+async def test_a_refused_monthly_file_falls_back_to_minutes_and_names_the_cause(monkeypatch):
+    import asyncio as aio
+
+    async def no_sleep(_):
+        return None
+
+    monkeypatch.setattr(aio, "sleep", no_sleep)  # the backoff waits are not what is tested
+    respx.get(url__regex=r".*/BID_candles_hour_1\.bi5").mock(return_value=httpx.Response(503))
+    minute = lzma.compress(struct.pack(">IIIIIf", 0, 110100, 110110, 110090, 110120, 1.0), format=lzma.FORMAT_ALONE)
+    respx.get(url__regex=r".*/BID_candles_min_1\.bi5").mock(return_value=httpx.Response(200, content=minute))
+    async with httpx.AsyncClient() as client:
+        bars, stats = await download_dukascopy_h1(client, "EUR/USD", date(2024, 1, 1), date(2024, 3, 1), today=date(2024, 6, 1))
+    assert len(bars) == 31 + 29 and stats["monthly"] == 0 and stats["from_minutes"] == 2
+    assert "HTTP 503" in stats["monthly_problem"]
+
+
+@respx.mock
+async def test_a_minute_file_that_keeps_failing_names_the_http_status(monkeypatch):
+    import asyncio as aio
+
+    async def no_sleep(_):
+        return None
+
+    monkeypatch.setattr(aio, "sleep", no_sleep)
+    respx.get(url__regex=r".*/BID_candles_min_1\.bi5").mock(return_value=httpx.Response(429))
+    from tradeengine.history import download_dukascopy
+
+    async with httpx.AsyncClient() as client:
+        with pytest.raises(RuntimeError, match="HTTP 429 after 4 attempts"):
+            await download_dukascopy(client, "EUR/USD", date(2024, 1, 2), date(2024, 1, 3))
 
 
 def test_gold_scale_and_price_range_check():
@@ -357,3 +390,19 @@ async def test_no_action_on_stale_history(crypto_env):
     now = datetime(2024, 3, 31, 0, 0, 30, tzinfo=UTC)
     assert await StrategyRunner(e, {"always_d1": strat}).on_hour(now) == []
     assert fake.open_calls == 0
+
+
+def test_download_all_exits_non_zero_when_forex_history_fails(tmp_path, monkeypatch, capsys):
+    from tradeengine import cli
+
+    cfg = InfraConfig(_env_file=None, database_url=f"sqlite+aiosqlite:///{tmp_path / 'e.db'}", data_dir=tmp_path)
+    monkeypatch.setattr(cli, "load_config", lambda: cfg)
+    monkeypatch.setattr(cli, "_engine", lambda need_brokers=True: Engine(cfg, adapters={Venue.CAPITAL: HistoryFake(Venue.CAPITAL, trending_h1("2026-10-01", "2026-11-01"), "USD")}))
+
+    async def boom(cfg_, symbol, start, end):
+        raise RuntimeError("Dukascopy x: HTTP 503 after 4 attempts")
+
+    monkeypatch.setattr(cli, "_download_dukascopy", boom)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["download-all", "--from", "2026-10-01"])
+    assert "Download incomplete (11)" in str(e.value) and "dukascopy XAU/USD" in str(e.value)

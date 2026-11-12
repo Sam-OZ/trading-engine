@@ -203,7 +203,7 @@ def cross_check(existing, new, spread: float) -> tuple[int, float, float]:
     return len(both), float(diff.max()), float((diff > spread).mean())
 
 
-async def _download_dukascopy(cfg, symbol: str, start, end) -> None:
+async def _download_dukascopy(cfg, symbol: str, start, end) -> bool:
     """Hourly Dukascopy history; checked against the hours already on disk before it is merged in."""
     from .backtest import cost_for
 
@@ -212,6 +212,8 @@ async def _download_dukascopy(cfg, symbol: str, start, end) -> None:
     path = history_path(cfg.data_dir, "dukascopy", symbol, "H1")
     first = bars[0].open_time.date() if bars else None
     where = f"{stats['monthly']} monthly files, {stats['from_minutes']} month(s) from minute files"
+    if stats.get("monthly_problem"):
+        where += f"; monthly files: {stats['monthly_problem']}"
     n_overlap, max_diff, share = cross_check(read_frame(path), bars_to_frame(bars) if bars else None, cost_for(symbol).spread or 0.0)
     check = ""
     if n_overlap:
@@ -219,9 +221,10 @@ async def _download_dukascopy(cfg, symbol: str, start, end) -> None:
         if share > 0.01:
             print(f"  dukascopy {symbol:<9} NOT SAVED: {share:.1%} of the {n_overlap:,} overlapping hours differ from the file "
                   f"on disk by more than one spread (max {max_diff:.5g}). Send this line to Claude.")
-            return
+            return False
     n = write_bars(path, bars)
     print(f"  dukascopy {symbol:<9} H1: {len(bars):,} bars from {first} ({where}){check}; file {n:,} rows")
+    return True
 
 
 async def cmd_download_all(args) -> None:
@@ -236,6 +239,7 @@ async def cmd_download_all(args) -> None:
         settings = await eng.settings_store.load()
         from .round2 import ROUND2_SYMBOLS
 
+        failed: list[str] = []
         for sym in dict.fromkeys([*settings.instruments, *ROUND2_SYMBOLS]):  # the round 2 basket even if not traded
             inst = DEFAULT_INSTRUMENTS.get(sym)
             if inst is None:
@@ -248,13 +252,20 @@ async def cmd_download_all(args) -> None:
                     await _download_broker(cfg, adapter, inst.venue.value, inst, "H1", b_start, end)
                 except Exception as e:
                     print(f"  {inst.venue.value:<9} {sym:<9} failed: {e}")
+                    if inst.venue is Venue.BINANCE:
+                        failed.append(f"binance {sym}")  # Binance is crypto's only history source
             if inst.kind.value in ("fx", "metal") and not args.no_dukascopy:
                 try:
-                    await _download_dukascopy(cfg, sym, start, end)
+                    if not await _download_dukascopy(cfg, sym, start, end):
+                        failed.append(f"dukascopy {sym}")
                 except Exception as e:
                     print(f"  dukascopy {sym:<9} failed: {e}")
+                    failed.append(f"dukascopy {sym}")
     finally:
         await eng.stop()
+    if failed:
+        # Non-zero exit, so scripts/round2.sh stops here instead of running a backtest on missing data.
+        sys.exit(f"Download incomplete ({len(failed)}): {', '.join(failed)}. Send this output to Claude.")
 
 
 async def cmd_gate2(args) -> None:
@@ -329,9 +340,12 @@ async def cmd_round2(args) -> None:
         fp = r2.fingerprint(settings)
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         if args.dev:
+            print(f"Round 2 development run (data to {r2.DEV_END:%Y-%m-%d}; this takes several minutes):")
+            try:
+                runs, verdicts, notes = r2.run_dev(cfg.data_dir, settings, DEFAULT_INSTRUMENTS)
+            except r2.IncompleteData as e:
+                sys.exit(f"Not run: {e}")
             n = await r2.count_dev_run(eng.db)
-            print(f"Round 2 development run #{n} (data to {r2.DEV_END:%Y-%m-%d}; this takes several minutes):")
-            runs, verdicts, notes = r2.run_dev(cfg.data_dir, settings, DEFAULT_INSTRUMENTS)
             extra = [f"Development run number {n} (every run is counted)."]
             md = r2.render("dev", runs, verdicts, notes, fp, extra, r2.Limits.from_settings(settings))
             out = r2.save(cfg.data_dir / "reports" / f"round2-dev-{stamp}", md, r2.dev_payload(runs, verdicts, fp, n), runs)

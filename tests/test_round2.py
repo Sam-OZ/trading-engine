@@ -451,3 +451,16 @@ def test_cli_holdout_with_nothing_passed_runs_nothing(small_round, monkeypatch, 
     with pytest.raises(SystemExit) as e:
         cli_main(["round2", "--holdout", str(tmp_path / "dev.json"), "--yes"])
     assert "nothing to run on the holdout" in str(e.value)
+
+
+def test_dev_run_refuses_an_incomplete_basket(small_round, monkeypatch, tmp_path):
+    from tradeengine.cli import main as cli_main
+
+    (small_round / "history" / "dukascopy" / "USDJPY_H1.csv.gz").unlink()
+    with pytest.raises(r2.IncompleteData, match="USD/JPY"):
+        r2.run_dev(small_round, _settings(), DEFAULT_INSTRUMENTS, progress=lambda *_: None)
+    _cli_env(monkeypatch, tmp_path)
+    with pytest.raises(SystemExit) as e:
+        cli_main(["round2", "--dev"])
+    assert "Not run: history missing or short for: USD/JPY" in str(e.value)
+    assert not (tmp_path / "data" / "reports").exists()  # nothing produced, nothing counted
