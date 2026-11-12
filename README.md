@@ -39,12 +39,13 @@ src/tradeengine/
   trend.py           round 2: daily channel breakout, daily time-series momentum, 4-hour breakout with daily filter
   backtest.py        fill model with costs, metrics, round 1 walk-forward, Gate 2 report
   portfolio.py       portfolio backtest: all instruments together through the live risk limits
-  round2.py          round 2 development/holdout runs, frozen basket, one-look holdout lock
+  round2.py          research-round machinery (plan, walk-forward, frozen basket, one-look lock) + round 2's plan
+  round3.py          round 3's plan (crypto only)
   runner.py          hourly live runner: signals + trail/exits on each strategy's own bars (off until gate2-apply)
   gate1.py           live demo checks for Gate 1
   cli.py             `tradeengine` command
 tests/               unit tests (no network; brokers are mocked)
-scripts/             with-secrets.sh, gate1.sh, phase2.sh, round2.sh
+scripts/             with-secrets.sh, gate1.sh, phase2.sh, round2.sh, round3.sh
 ```
 
 ## One-time setup on your Mac
@@ -155,6 +156,29 @@ It runs only strategies that passed development, only on their frozen basket, 1 
 code and settings before the result is shown; a second run is refused, and so is a development result
 made with different code or settings. Pass: PF >= 1.2, drawdown < 10%, >= 100 trades. A pass is switched
 on for demo with `gate2-apply` on the holdout's `result.json`.
+
+## Round 3: crypto only, pre-registered (12 Nov 2026)
+
+Round 2 found nothing on the 13-instrument basket (all three strategies hit the 10% drawdown stop).
+Round 3 tests two long-only rules on Bitcoin and Ethereum spot (no overnight funding): round 2's
+4-hour breakout with daily filter, unchanged, and a fast daily momentum rule (hold while the 14/28/56-day
+return is positive). Constants in `src/tradeengine/round3.py`; the machinery is round 2's.
+
+```bash
+cd ~/Downloads/Source_Code/Crypto_Forex
+./scripts/round3.sh
+```
+
+Development 2018 – Oct 2023, walk-forward 24/6 months. Check 1: PF >= 1.2, drawdown < 10%,
+>= 60 trades, and a statistical check (the 5th percentile of 10,000 seeded bootstrap averages of trade
+R must be above zero). The holdout (Nov 2023 – Oct 2026, >= 40 trades, same checks) is one run per
+strategy, ever, with its own lock:
+
+```bash
+uv run tradeengine round3 --holdout data/reports/round3-dev-<time>/result.json
+```
+
+If nothing passes, strategy research stops: evidence after round 3 comes only from demo forward tests.
 
 ## Everyday commands
 

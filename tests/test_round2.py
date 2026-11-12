@@ -410,7 +410,7 @@ def test_cli_dev_then_one_holdout_and_a_second_look_is_refused(small_round, monk
     from tradeengine.cli import main as cli_main
 
     _cli_env(monkeypatch, tmp_path)
-    monkeypatch.setattr(r2, "fingerprint", lambda s: "fp-test")
+    monkeypatch.setattr(r2, "fingerprint", lambda *a: "fp-test")
     cli_main(["round2", "--dev"])
     out = capsys.readouterr().out
     assert "CHECK 1:" in out and "Development run number 1" in out
@@ -445,7 +445,7 @@ def test_cli_holdout_with_nothing_passed_runs_nothing(small_round, monkeypatch, 
     from tradeengine.cli import main as cli_main
 
     _cli_env(monkeypatch, tmp_path)
-    monkeypatch.setattr(r2, "fingerprint", lambda s: "fp")
+    monkeypatch.setattr(r2, "fingerprint", lambda *a: "fp")
     (tmp_path / "dev.json").write_text(json.dumps({"kind": "round2-dev", "fingerprint": "fp",
                                                    "strategies": {"tsmom_d1": {"passed": False, "basket": []}}}))
     with pytest.raises(SystemExit) as e:

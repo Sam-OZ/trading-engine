@@ -1,6 +1,8 @@
-"""Round 2 research run, exactly as pre-registered on 12 Nov 2026 (plan: Claude Docs "Trading engine -
-Round 2 research plan (pre-registered)"). The constants in this file ARE the pre-registration:
-changing them after seeing a result defeats the point.
+"""Pre-registered research rounds: round 2 (this file's constants) and round 3 (round3.py), both
+run by the machinery here, driven by a Plan (coins, dates, rules, strategies, lock names).
+Round 2 exactly as pre-registered on 12 Nov 2026 (plan: Claude Docs "Trading engine - Round 2
+research plan (pre-registered)"). The constants ARE the pre-registration: changing them after
+seeing a result defeats the point.
 
 Development (`tradeengine round2 --dev`)
     Data is cut at DEV_END before anything is computed, so no holdout price can reach it.
@@ -30,6 +32,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 from sqlalchemy import select
 
@@ -73,9 +76,63 @@ class Rules:
     basket_min_trades: int = 30
     basket_min_pf: float = 1.0
     sitout_min_pf: float = 1.0
+    # Statistical check (round 3): the 5th percentile of 10,000 seeded bootstrap means of trade R must be > 0.
+    bootstrap: bool = False
+    bootstrap_samples: int = 10_000
+    bootstrap_pct: float = 5.0
+    bootstrap_seed: int = 20261112
 
 
 RULES = Rules()
+
+
+@dataclass
+class Plan:
+    """One pre-registered round. Built by round2.plan() / round3.plan() from module constants at call time."""
+
+    number: int
+    symbols: list[str]
+    data_from: dict  # "fx" (Forex and gold) / "crypto" -> first date used
+    dev_end: pd.Timestamp
+    holdout_end: pd.Timestamp
+    rules: Rules
+    strategies: dict
+    wf_setting: str  # RuntimeSettings attribute with {strategy: [train months, test months]}
+
+    @property
+    def name(self) -> str:
+        return f"round{self.number}"
+
+    @property
+    def lock_prefix(self) -> str:
+        return f"{self.name}_holdout:"
+
+    @property
+    def counter_key(self) -> str:
+        return f"{self.name}_dev_runs"
+
+    def start_for(self, inst) -> pd.Timestamp:
+        return self.data_from["crypto" if inst.kind is AssetKind.CRYPTO_SPOT else "fx"]
+
+    def wf(self, settings) -> dict[str, list[int]]:
+        return getattr(settings, self.wf_setting)
+
+
+def plan() -> Plan:
+    """Round 2, read from the module constants at call time."""
+    return Plan(2, ROUND2_SYMBOLS, {"fx": DATA_FROM_FX, "crypto": DATA_FROM_CRYPTO}, DEV_END, HOLDOUT_END, RULES,
+                ROUND2_STRATEGIES, "round2_walk_forward")
+
+
+def bootstrap_lower_bound(rs: list[float], rules: Rules) -> float:
+    """The `bootstrap_pct` percentile of `bootstrap_samples` resampled means of the trade results (seeded,
+    so the same trades always give the same number). Above zero = about 95% confidence the average trade wins."""
+    x = np.asarray(rs, dtype=float)
+    if len(x) < 2:
+        return float("-inf")
+    rng = np.random.default_rng(rules.bootstrap_seed)
+    means = x[rng.integers(0, len(x), size=(rules.bootstrap_samples, len(x)))].mean(axis=1)
+    return float(np.percentile(means, rules.bootstrap_pct))
 START_EQUITY = 10_000.0  # per venue; percentages are what matter
 MAX_DATA_GAP = pd.Timedelta(days=4)  # longer than any weekend + holiday: a hole a download left
 
@@ -92,10 +149,11 @@ def require_complete(notes: list[str], data: dict) -> None:
                              + ". Run `./scripts/with-secrets.sh uv run tradeengine download-all --from 2013-01-01` first.")
 
 
-def load_round2_data(data_dir: Path, instruments: dict, until: pd.Timestamp) -> tuple[dict, list[str]]:
+def load_round2_data(data_dir: Path, instruments: dict, until: pd.Timestamp, pl: Plan | None = None) -> tuple[dict, list[str]]:
     """symbol -> (H1 frame cut to [data start, until), Instrument), plus one note per symbol."""
+    pl = pl or plan()
     data, notes = {}, []
-    for sym in ROUND2_SYMBOLS:
+    for sym in pl.symbols:
         inst = instruments.get(sym)
         if inst is None:
             notes.append(f"{sym}: not in the instrument list; skipped")
@@ -105,7 +163,7 @@ def load_round2_data(data_dir: Path, instruments: dict, until: pd.Timestamp) -> 
         if df is None or df.empty:
             notes.append(f"{sym}: no history file (run download-all --from 2013-01-01)")
             continue
-        start = DATA_FROM_CRYPTO if crypto else DATA_FROM_FX
+        start = pl.start_for(inst)
         df = df[(df.index >= start) & (df.index < until)]
         if df.empty:
             notes.append(f"{sym}: no history between {start:%Y-%m-%d} and {until:%Y-%m-%d}")
@@ -200,9 +258,11 @@ class StrategyRun:
     notes: list[str] = field(default_factory=list)
 
 
-def _legs_and_windows(strategy, data: dict, rates: RateBook, settings, progress, symbols: list[str] | None = None) -> tuple[dict, dict, dict, int]:
+def _legs_and_windows(strategy, data: dict, rates: RateBook, settings, progress, symbols: list[str] | None = None,
+                      pl: Plan | None = None) -> tuple[dict, dict, dict, int]:
     """Standalone backtests of every parameter set; walk-forward windows per symbol."""
-    train_m, test_m = settings.round2_walk_forward.get(strategy.name, [36, 6])
+    pl = pl or plan()
+    train_m, test_m = pl.wf(settings).get(strategy.name, [36, 6])
     grid = param_grid(strategy.grid)
     grid_params = {params_id(p): p for p in grid}
     risk_pct = float(settings.risk_per_trade_pct) / 100
@@ -228,15 +288,15 @@ def _legs_and_windows(strategy, data: dict, rates: RateBook, settings, progress,
             leg = Leg(sym, inst.kind, inst.venue, inst.base, inst.quote, cost, frames, [(first, last, p)],
                       prep_of=lambda q, s=strategy: prep_key(s, q))
             by_pid[params_id(p)] = simulate(strategy, [leg], rates, first, last, None, START_EQUITY, risk_pct).trades
-        windows[sym] = choose_windows(by_pid, first, some.index[-1], train_m, test_m, strategy.min_is_trades, RULES.sitout_min_pf)
+        windows[sym] = choose_windows(by_pid, first, some.index[-1], train_m, test_m, strategy.min_is_trades, pl.rules.sitout_min_pf)
         legs[sym] = Leg(sym, inst.kind, inst.venue, inst.base, inst.quote, cost, frames, [],
                         prep_of=lambda q, s=strategy: prep_key(s, q))
     return legs, windows, grid_params, len(grid) * len(legs)
 
 
 def run_strategy(strategy, data: dict, rates: RateBook, settings, start: pd.Timestamp | None, end: pd.Timestamp,
-                 symbols: list[str] | None, progress=print) -> StrategyRun:
-    legs, windows, grid_params, configs = _legs_and_windows(strategy, data, rates, settings, progress, symbols)
+                 symbols: list[str] | None, progress=print, pl: Plan | None = None) -> StrategyRun:
+    legs, windows, grid_params, configs = _legs_and_windows(strategy, data, rates, settings, progress, symbols, pl)
     use = [s for s in legs if symbols is None or s in symbols]
     if start is None:  # development: from the first test window anywhere
         firsts = [pd.Timestamp(w[0].train_end) for s, w in windows.items() if s in use and w]
@@ -252,8 +312,17 @@ def run_strategy(strategy, data: dict, rates: RateBook, settings, start: pd.Time
 
 
 # ------------------------------------------------------------------ verdicts
-def judge_dev(run: StrategyRun) -> tuple[bool, list[str], list[str]]:
-    m, r = run.metrics, RULES
+def _stat_reason(run: StrategyRun, r: Rules) -> tuple[float | None, list[str]]:
+    if not r.bootstrap:
+        return None, []
+    lb = bootstrap_lower_bound([t.r for t in run.trades], r)
+    if lb > 0:
+        return lb, []
+    return lb, [f"statistical check: {r.bootstrap_pct:g}th-percentile average R {lb:+.3f}, needs > 0"]
+
+
+def judge_dev(run: StrategyRun, r: Rules | None = None) -> tuple[bool, list[str], list[str]]:
+    m, r = run.metrics, r or RULES
     reasons = []
     if m.trades < r.dev_min_trades:
         reasons.append(f"{m.trades} trades, needs {r.dev_min_trades}")
@@ -261,12 +330,13 @@ def judge_dev(run: StrategyRun) -> tuple[bool, list[str], list[str]]:
         reasons.append(f"profit factor {m.profit_factor:.2f}, needs {r.dev_min_pf}")
     if m.max_drawdown_pct >= r.dev_max_dd_pct:
         reasons.append(f"drawdown {m.max_drawdown_pct:.1f}%, limit {r.dev_max_dd_pct}%")
+    reasons += _stat_reason(run, r)[1]
     basket = sorted(s for s, (n, p, _) in run.per_symbol.items() if n >= r.basket_min_trades and p >= r.basket_min_pf)
     return not reasons, reasons, basket
 
 
-def judge_holdout(run: StrategyRun, basket: list[str]) -> tuple[bool, list[str]]:
-    m, r = run.metrics, RULES
+def judge_holdout(run: StrategyRun, basket: list[str], r: Rules | None = None) -> tuple[bool, list[str]]:
+    m, r = run.metrics, r or RULES
     reasons = []
     if not basket:
         reasons.append("no instrument qualified on development data")
@@ -276,6 +346,7 @@ def judge_holdout(run: StrategyRun, basket: list[str]) -> tuple[bool, list[str]]
         reasons.append(f"profit factor {m.profit_factor:.2f}, needs {r.holdout_min_pf}")
     if m.max_drawdown_pct >= r.holdout_max_dd_pct:
         reasons.append(f"drawdown {m.max_drawdown_pct:.1f}%, limit {r.holdout_max_dd_pct}%")
+    reasons += _stat_reason(run, r)[1]
     return not reasons, reasons
 
 
@@ -285,45 +356,53 @@ def current_params(run: StrategyRun) -> dict[str, str]:
 
 
 # ------------------------------------------------------------------ fingerprint + one-look lock
-def fingerprint(settings) -> str:
-    """Hash of the strategy, simulator and round 2 code plus every setting that changes a result."""
+def fingerprint(settings, pl: Plan | None = None) -> str:
+    """Hash of the strategy, simulator and round code plus every setting that changes a result."""
     from . import round2 as me
+    from . import round3 as r3
 
-    parts = [inspect.getsource(m) for m in (trend_mod, pf_mod, me)]
-    parts.append(json.dumps({k: asdict(cost_for(k, settings.cost_model)) for k in sorted(set(DEFAULT_COSTS) | set(ROUND2_SYMBOLS))}, sort_keys=True))
+    pl = pl or plan()
+    parts = [inspect.getsource(m) for m in (trend_mod, pf_mod, me, r3)]
+    parts.append(json.dumps({k: asdict(cost_for(k, settings.cost_model)) for k in sorted(set(DEFAULT_COSTS) | set(pl.symbols))}, sort_keys=True))
     parts.append(json.dumps(asdict(Limits.from_settings(settings)), sort_keys=True))
-    parts.append(json.dumps(settings.round2_walk_forward, sort_keys=True))
+    parts.append(json.dumps(pl.wf(settings), sort_keys=True))
+    parts.append(json.dumps({"symbols": pl.symbols, "from": {k: str(v) for k, v in pl.data_from.items()}, "dev_end": str(pl.dev_end),
+                             "holdout_end": str(pl.holdout_end), "rules": asdict(pl.rules), "strategies": sorted(pl.strategies)}, sort_keys=True))
     return hashlib.sha256("\n".join(parts).encode()).hexdigest()[:16]
 
 
-LOCK_PREFIX = "round2_holdout:"
+LOCK_PREFIX = "round2_holdout:"  # round 2's; each plan has its own (Plan.lock_prefix)
 
 
-async def holdout_record(db, strategy: str) -> dict | None:
+async def holdout_record(db, strategy: str, pl: Plan | None = None) -> dict | None:
+    prefix = (pl or plan()).lock_prefix
     async with db.sessions() as s:
-        row = await s.get(StateRow, LOCK_PREFIX + strategy)
+        row = await s.get(StateRow, prefix + strategy)
         return dict(row.value) if row else None
 
 
-async def all_holdout_records(db) -> dict[str, dict]:
+async def all_holdout_records(db, pl: Plan | None = None) -> dict[str, dict]:
+    prefix = (pl or plan()).lock_prefix
     async with db.sessions() as s:
-        rows = (await s.execute(select(StateRow).where(StateRow.key.like(LOCK_PREFIX + "%")))).scalars().all()
-    return {r.key[len(LOCK_PREFIX):]: dict(r.value) for r in rows}
+        rows = (await s.execute(select(StateRow).where(StateRow.key.like(prefix + "%")))).scalars().all()
+    return {r.key[len(prefix):]: dict(r.value) for r in rows}
 
 
-async def record_holdout(db, strategy: str, value: dict) -> None:
+async def record_holdout(db, strategy: str, value: dict, pl: Plan | None = None) -> None:
+    prefix = (pl or plan()).lock_prefix
     async with db.sessions() as s, s.begin():
-        if await s.get(StateRow, LOCK_PREFIX + strategy) is not None:
+        if await s.get(StateRow, prefix + strategy) is not None:
             raise RuntimeError(f"{strategy}: the holdout was already run")
-        s.add(StateRow(key=LOCK_PREFIX + strategy, value=value))
+        s.add(StateRow(key=prefix + strategy, value=value))
 
 
-async def count_dev_run(db) -> int:
+async def count_dev_run(db, pl: Plan | None = None) -> int:
+    key = (pl or plan()).counter_key
     async with db.sessions() as s, s.begin():
-        row = await s.get(StateRow, "round2_dev_runs")
+        row = await s.get(StateRow, key)
         n = (row.value.get("n", 0) if row else 0) + 1
         if row is None:
-            s.add(StateRow(key="round2_dev_runs", value={"n": n}))
+            s.add(StateRow(key=key, value={"n": n}))
         else:
             row.value = {"n": n}
     return n
@@ -341,28 +420,34 @@ def _metrics_row(m: PortfolioMetrics) -> str:
 
 
 def render(kind: str, runs: list[StrategyRun], verdicts: dict[str, dict], notes: list[str], fp: str, extra: list[str],
-           limits: Limits | None = None) -> str:
-    r, lm = RULES, limits or Limits()
+           limits: Limits | None = None, pl: Plan | None = None) -> str:
+    pl = pl or plan()
+    r, lm = pl.rules, limits or Limits()
     title = "development (check 1)" if kind == "dev" else "HOLDOUT (check 2, one look)"
-    out = [f"# Round 2 — {title} ({datetime.now().strftime('%Y-%m-%d %H:%M')})", "",
+    out = [f"# Round {pl.number} — {title} ({datetime.now().strftime('%Y-%m-%d %H:%M')})", "",
            f"Code and settings fingerprint: `{fp}`", *extra, ""]
+    stat = (f", and the statistical check ({r.bootstrap_pct:g}th percentile of {r.bootstrap_samples:,} bootstrap averages of "
+            "trade R above zero)") if r.bootstrap else ""
+    first = min(pl.data_from.values())
     if kind == "dev":
-        out.append(f"Check 1 (development test windows, {DATA_FROM_FX:%Y} – {DEV_END:%b %Y}): profit factor >= {r.dev_min_pf}, "
-                   f"worst-account drawdown < {r.dev_max_dd_pct}%, >= {r.dev_min_trades} trades. Basket for the holdout: "
+        out.append(f"Check 1 (development test windows, {first:%Y} – {pl.dev_end:%b %Y}): profit factor >= {r.dev_min_pf}, "
+                   f"worst-account drawdown < {r.dev_max_dd_pct}%, >= {r.dev_min_trades} trades{stat}. Basket for the holdout: "
                    f">= {r.basket_min_trades} development trades and PF >= {r.basket_min_pf}.")
     else:
-        out.append(f"Check 2 (holdout {DEV_END:%b %Y} – {HOLDOUT_END - pd.Timedelta(days=1):%b %Y}, frozen basket): profit factor >= "
-                   f"{r.holdout_min_pf}, worst-account drawdown < {r.holdout_max_dd_pct}%, >= {r.holdout_min_trades} trades.")
+        out.append(f"Check 2 (holdout {pl.dev_end:%b %Y} – {pl.holdout_end - pd.Timedelta(days=1):%b %Y}, frozen basket): profit factor >= "
+                   f"{r.holdout_min_pf}, worst-account drawdown < {r.holdout_max_dd_pct}%, >= {r.holdout_min_trades} trades{stat}.")
     out += [f"One portfolio per strategy with the live limits ({lm.risk_pct * 100:g}% risk, {lm.max_open} open, {lm.per_instrument} per "
             f"instrument, {lm.per_currency} per currency, {lm.leverage:g}:1 leverage, {lm.daily_loss_pct:g}% daily loss, "
             f"{lm.max_dd_pct:g}% drawdown halt). Costs: spread, slippage, commission, overnight funding (see cost_model). "
             "Profit factor on R multiples. Drawdown marked to market, per account (Capital.com, Binance); the worse one counts.", ""]
     out += ["## Data", *[f"- {n}" for n in notes], ""]
-    out += ["## Verdict", "", "| Strategy | Result | Trades | Win | PF | Exp R | Max DD (per account) | Return | Sharpe | Why not |",
-            "|---|---|---|---|---|---|---|---|---|---|"]
+    lb_head, lb_rule = ("| Lower bound R ", "|---") if r.bootstrap else ("", "")
+    out += ["## Verdict", "", f"| Strategy | Result | Trades | Win | PF | Exp R | Max DD (per account) | Return | Sharpe {lb_head}| Why not |",
+            f"|---|---|---|---|---|---|---|---|---{lb_rule}|---|"]
     for run in runs:
         v = verdicts[run.strategy]
-        out.append(f"| {run.strategy} | {'PASS' if v['passed'] else 'not passed'} | {_metrics_row(run.metrics)} | {'; '.join(v['reasons']) or '—'} |")
+        lb = f" | {v['lower_bound']:+.3f}" if r.bootstrap and v.get("lower_bound") is not None else (" | —" if r.bootstrap else "")
+        out.append(f"| {run.strategy} | {'PASS' if v['passed'] else 'not passed'} | {_metrics_row(run.metrics)}{lb} | {'; '.join(v['reasons']) or '—'} |")
     out.append("")
     for run in runs:
         v = verdicts[run.strategy]
@@ -407,24 +492,27 @@ def _run_payload(run: StrategyRun) -> dict:
 
 
 # ------------------------------------------------------------------ drivers
-def run_dev(data_dir: Path, settings, instruments: dict, strategies: dict | None = None, progress=print):
-    strategies = strategies or ROUND2_STRATEGIES
-    data, notes = load_round2_data(data_dir, instruments, DEV_END)
+def run_dev(data_dir: Path, settings, instruments: dict, strategies: dict | None = None, progress=print, pl: Plan | None = None):
+    pl = pl or plan()
+    strategies = strategies or pl.strategies
+    data, notes = load_round2_data(data_dir, instruments, pl.dev_end, pl)
     require_complete(notes, data)
     rates = rate_book(data)
     runs, verdicts = [], {}
     for strat in strategies.values():
-        run = run_strategy(strat, data, rates, settings, None, DEV_END, None, progress)
-        passed, reasons, basket = judge_dev(run)
+        run = run_strategy(strat, data, rates, settings, None, pl.dev_end, None, progress, pl)
+        passed, reasons, basket = judge_dev(run, pl.rules)
         runs.append(run)
-        verdicts[strat.name] = {"passed": passed, "reasons": reasons, "basket": basket}
+        verdicts[strat.name] = {"passed": passed, "reasons": reasons, "basket": basket, "lower_bound": _stat_reason(run, pl.rules)[0]}
     return runs, verdicts, notes
 
 
-def run_holdout(data_dir: Path, settings, instruments: dict, dev: dict, strategies: dict | None = None, progress=print):
+def run_holdout(data_dir: Path, settings, instruments: dict, dev: dict, strategies: dict | None = None, progress=print,
+                pl: Plan | None = None):
     """Holdout for the strategies that passed development, on their frozen baskets."""
-    strategies = strategies or ROUND2_STRATEGIES
-    data, notes = load_round2_data(data_dir, instruments, HOLDOUT_END)
+    pl = pl or plan()
+    strategies = strategies or pl.strategies
+    data, notes = load_round2_data(data_dir, instruments, pl.holdout_end, pl)
     require_complete(notes, data)
     rates = rate_book(data)
     runs, verdicts = [], {}
@@ -432,23 +520,26 @@ def run_holdout(data_dir: Path, settings, instruments: dict, dev: dict, strategi
         if not d["passed"] or name not in strategies:
             continue
         basket = d["basket"]
-        run = run_strategy(strategies[name], data, rates, settings, DEV_END, HOLDOUT_END, basket, progress)
-        passed, reasons = judge_holdout(run, basket)
+        run = run_strategy(strategies[name], data, rates, settings, pl.dev_end, pl.holdout_end, basket, progress, pl)
+        passed, reasons = judge_holdout(run, basket, pl.rules)
         latest = current_params(run)
         runs.append(run)
-        verdicts[name] = {"passed": passed, "reasons": reasons, "basket": basket,
+        verdicts[name] = {"passed": passed, "reasons": reasons, "basket": basket, "lower_bound": _stat_reason(run, pl.rules)[0],
                           "enabled_symbols": [s for s in basket if s in latest] if passed else [], "latest_params": latest}
     return runs, verdicts, notes
 
 
-def dev_payload(runs, verdicts, fp: str, run_no: int) -> dict:
-    return {"kind": "round2-dev", "fingerprint": fp, "run_at": datetime.now(UTC).isoformat(), "dev_run_number": run_no,
-            "rules": asdict(RULES), "strategies": {r.strategy: {**verdicts[r.strategy], **_run_payload(r)} for r in runs}}
+def dev_payload(runs, verdicts, fp: str, run_no: int, pl: Plan | None = None) -> dict:
+    pl = pl or plan()
+    return {"kind": f"{pl.name}-dev", "fingerprint": fp, "run_at": datetime.now(UTC).isoformat(), "dev_run_number": run_no,
+            "rules": asdict(pl.rules), "strategies": {r.strategy: {**verdicts[r.strategy], **_run_payload(r)} for r in runs}}
 
 
-def holdout_payload(runs, verdicts, fp: str, dev_path: str) -> dict:
+def holdout_payload(runs, verdicts, fp: str, dev_path: str, pl: Plan | None = None) -> dict:
+    pl = pl or plan()
     return {
-        "kind": "round2-holdout", "fingerprint": fp, "run_at": datetime.now(UTC).isoformat(), "dev_result": dev_path, "rules": asdict(RULES),
+        "kind": f"{pl.name}-holdout", "fingerprint": fp, "run_at": datetime.now(UTC).isoformat(), "dev_result": dev_path,
+        "rules": asdict(pl.rules),
         # gate2-apply reads "verdicts"
         "verdicts": [{"strategy": r.strategy, "passed": verdicts[r.strategy]["passed"], "reasons": verdicts[r.strategy]["reasons"],
                       "pooled": asdict(r.metrics), "enabled_symbols": verdicts[r.strategy]["enabled_symbols"],

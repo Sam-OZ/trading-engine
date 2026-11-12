@@ -13,6 +13,7 @@
   gate2                   round 1: walk-forward backtest of the hourly strategies, Gate 2 verdict + report
   round2 --dev            round 2 development run (check 1) + frozen basket
   round2 --holdout <dev result.json>   round 2 holdout (check 2): ONE run per strategy, ever
+  round3 --dev / --holdout <json>      round 3 (crypto only), same rules of play
   gate2-apply <json>      switch on the strategies that passed (Gate 2 or round 2 holdout result)
 """
 
@@ -343,25 +344,37 @@ async def cmd_instruments(_args) -> None:
 
 
 async def cmd_round2(args) -> None:
-    from . import round2 as r2
+    await _cmd_round(args, 2)
 
+
+async def cmd_round3(args) -> None:
+    await _cmd_round(args, 3)
+
+
+async def _cmd_round(args, number: int) -> None:
+    """A pre-registered research round: `--dev` (check 1) or `--holdout <dev result.json>` (check 2, once)."""
+    from . import round2 as r2
+    from . import round3 as r3
+
+    pl = r2.plan() if number == 2 else r3.plan()
+    rname = pl.name
     cfg = load_config()
     eng = _engine(need_brokers=False)
     try:
         await eng.db.create_all()
         settings = await eng.settings_store.load()
-        fp = r2.fingerprint(settings)
+        fp = r2.fingerprint(settings, pl)
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         if args.dev:
-            print(f"Round 2 development run (data to {r2.DEV_END:%Y-%m-%d}; this takes several minutes):")
+            print(f"Round {number} development run (data to {pl.dev_end:%Y-%m-%d}; this takes a few minutes):")
             try:
-                runs, verdicts, notes = r2.run_dev(cfg.data_dir, settings, DEFAULT_INSTRUMENTS)
+                runs, verdicts, notes = r2.run_dev(cfg.data_dir, settings, DEFAULT_INSTRUMENTS, pl=pl)
             except r2.IncompleteData as e:
                 sys.exit(f"Not run: {e}")
-            n = await r2.count_dev_run(eng.db)
+            n = await r2.count_dev_run(eng.db, pl)
             extra = [f"Development run number {n} (every run is counted)."]
-            md = r2.render("dev", runs, verdicts, notes, fp, extra, r2.Limits.from_settings(settings))
-            out = r2.save(cfg.data_dir / "reports" / f"round2-dev-{stamp}", md, r2.dev_payload(runs, verdicts, fp, n), runs)
+            md = r2.render("dev", runs, verdicts, notes, fp, extra, r2.Limits.from_settings(settings), pl)
+            out = r2.save(cfg.data_dir / "reports" / f"{rname}-dev-{stamp}", md, r2.dev_payload(runs, verdicts, fp, n, pl), runs)
             print()
             print(md)
             print(f"\nReport folder: {out}")
@@ -370,15 +383,15 @@ async def cmd_round2(args) -> None:
             return
         dev_path = Path(args.holdout)
         dev = json.loads(dev_path.read_text())
-        if dev.get("kind") != "round2-dev":
-            sys.exit(f"{dev_path} is not a round 2 development result.json")
+        if dev.get("kind") != f"{rname}-dev":
+            sys.exit(f"{dev_path} is not a round {number} development result.json")
         if dev.get("fingerprint") != fp:
             sys.exit(f"Code or settings changed since that development run (fingerprint {dev.get('fingerprint')} then, {fp} now). "
-                     "Run `tradeengine round2 --dev` again first.")
+                     f"Run `tradeengine {rname} --dev` again first.")
         eligible = [name for name, d in dev["strategies"].items() if d["passed"]]
         if not eligible:
             sys.exit("No strategy passed development, so there is nothing to run on the holdout. All strategies stay off.")
-        done = await r2.all_holdout_records(eng.db)
+        done = await r2.all_holdout_records(eng.db, pl)
         for name in eligible:
             if name in done:
                 print(f"{name}: the holdout was already run on {done[name].get('run_at', '?')[:16]} "
@@ -391,17 +404,17 @@ async def cmd_round2(args) -> None:
         if not args.yes and input("Type HOLDOUT to run it now: ").strip() != "HOLDOUT":
             sys.exit("Not run.")
         dev_todo = {**dev, "strategies": {n: d for n, d in dev["strategies"].items() if n in todo}}
-        runs, verdicts, notes = r2.run_holdout(cfg.data_dir, settings, DEFAULT_INSTRUMENTS, dev_todo)
-        out_dir = cfg.data_dir / "reports" / f"round2-holdout-{stamp}"
+        runs, verdicts, notes = r2.run_holdout(cfg.data_dir, settings, DEFAULT_INSTRUMENTS, dev_todo, pl=pl)
+        out_dir = cfg.data_dir / "reports" / f"{rname}-holdout-{stamp}"
         for run in runs:  # recorded BEFORE anything is shown, so the result cannot be looked at and re-rolled
             v = verdicts[run.strategy]
             await r2.record_holdout(eng.db, run.strategy, {
                 "fingerprint": fp, "run_at": datetime.now(UTC).isoformat(), "passed": v["passed"], "reasons": v["reasons"],
                 "basket": v["basket"], "trades": run.metrics.trades, "profit_factor": run.metrics.profit_factor,
                 "max_drawdown_pct": run.metrics.max_drawdown_pct, "report": str(out_dir), "dev_result": str(dev_path),
-            })
-        md = r2.render("holdout", runs, verdicts, notes, fp, [f"Development result: `{dev_path}`"], r2.Limits.from_settings(settings))
-        out = r2.save(out_dir, md, r2.holdout_payload(runs, verdicts, fp, str(dev_path)), runs)
+            }, pl)
+        md = r2.render("holdout", runs, verdicts, notes, fp, [f"Development result: `{dev_path}`"], r2.Limits.from_settings(settings), pl)
+        out = r2.save(out_dir, md, r2.holdout_payload(runs, verdicts, fp, str(dev_path), pl), runs)
         print()
         print(md)
         print(f"\nReport folder: {out}")
@@ -470,6 +483,11 @@ def main(argv: list[str] | None = None) -> None:
     mode.add_argument("--dev", action="store_true", help="development run (check 1)")
     mode.add_argument("--holdout", metavar="DEV_RESULT_JSON", help="the one holdout run (check 2)")
     r2p.add_argument("--yes", action="store_true", help="skip the HOLDOUT confirmation")
+    r3p = sub.add_parser("round3")
+    mode3 = r3p.add_mutually_exclusive_group(required=True)
+    mode3.add_argument("--dev", action="store_true", help="crypto development run (check 1)")
+    mode3.add_argument("--holdout", metavar="DEV_RESULT_JSON", help="the one crypto holdout run (check 2)")
+    r3p.add_argument("--yes", action="store_true", help="skip the HOLDOUT confirmation")
     ga = sub.add_parser("gate2-apply")
     ga.add_argument("result", help="data/reports/gate2-.../result.json")
     ga.add_argument("--dry-run", action="store_true")
@@ -487,6 +505,7 @@ def main(argv: list[str] | None = None) -> None:
         "instruments": cmd_instruments,
         "gate2": cmd_gate2,
         "round2": cmd_round2,
+        "round3": cmd_round3,
         "gate2-apply": cmd_gate2_apply,
     }[args.cmd]
     asyncio.run(handler(args))

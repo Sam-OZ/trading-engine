@@ -55,7 +55,10 @@ class RuntimeSettings(BaseModel):
         "channel_breakout_d1": [36, 6], "tsmom_d1": [36, 6], "breakout_h4_dfilter": [24, 6],
     }
 
-    @field_validator("round2_walk_forward")
+    # Round 3 (crypto) walk-forward, per strategy (pre-registered 12 Nov 2026)
+    round3_walk_forward: dict[str, list[int]] = {"breakout_h4_dfilter": [24, 6], "tsmom_fast_d1": [24, 6]}
+
+    @field_validator("round2_walk_forward", "round3_walk_forward")
     @classmethod
     def _wf(cls, v: dict[str, list[int]]) -> dict[str, list[int]]:
         for name, pair in v.items():

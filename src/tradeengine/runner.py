@@ -51,11 +51,11 @@ from .models import (
 from .sizing import round_to_tick
 from .state import log_event
 from .strategies import STRATEGIES, WARMUP_BARS, columns, trailed_stop
-from .trend import ROUND2_STRATEGIES, prep_key, prepare
+from .trend import ROUND2_STRATEGIES, ROUND3_STRATEGIES, prep_key, prepare
 
 log = logging.getLogger(__name__)
 
-ALL_STRATEGIES = {**STRATEGIES, **ROUND2_STRATEGIES}
+ALL_STRATEGIES = {**STRATEGIES, **ROUND2_STRATEGIES, **ROUND3_STRATEGIES}
 
 # Daily EMA200s need a long run-in before they stop depending on where the data starts:
 # 1,100 days leaves ~600 daily bars after the seed, so live values match the backtest's.

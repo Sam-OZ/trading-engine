@@ -221,7 +221,51 @@ class BreakoutH4DailyFilter:
         return False
 
 
+@dataclass
+class TimeSeriesMomentumFastD1:
+    """Round 3 C2: hold while the L-day return is positive (short while negative where shorting is
+    allowed); checked at every daily close; exit at the next open once it is no longer positive.
+    Safety stop 3 x ATR(20), trailed at 4 x ATR."""
+
+    name: str = "tsmom_fast_d1"
+    timeframe: str = "D1"
+    prep_keys: tuple = ("lookback",)
+    min_is_trades: int = 8
+    min_history_days: int = 120
+    trail_activate_r: float = 0.0
+    default_params: dict = field(default_factory=lambda: {"lookback": 28, "stop_atr": 3.0, "trail_atr": 4.0})
+    grid: dict = field(default_factory=lambda: {"lookback": [14, 28, 56], "stop_atr": [3.0], "trail_atr": [4.0]})
+
+    def prepare(self, h1: pd.DataFrame, params: dict, crypto: bool = False) -> pd.DataFrame:
+        d = daily_from_h1(h1, crypto)
+        n = int(params["lookback"])
+        d["ret"] = d["close"] / d["close"].shift(n) - 1.0
+        d["atr"] = ind.atr(d["high"], d["low"], d["close"], 20)
+        d["ready"] = d[["ret", "atr"]].notna().all(axis=1)
+        return d
+
+    def signal_at(self, cols, i, p, allow_short):
+        c, atr, ret = cols["close"][i], cols["atr"][i], cols["ret"][i]
+        if not _finite(c, atr, ret) or atr <= 0:
+            return None
+        if ret > 0:
+            return Signal(Side.BUY, c, c - p["stop_atr"] * atr, None, atr, f"{p['lookback']}-day return positive ({ret:+.1%})",
+                          p["trail_atr"], None, None, 0.0)
+        if allow_short and ret < 0:
+            return Signal(Side.SELL, c, c + p["stop_atr"] * atr, None, atr, f"{p['lookback']}-day return negative ({ret:+.1%})",
+                          p["trail_atr"], None, None, 0.0)
+        return None
+
+    def exit_at(self, cols, i, side, p) -> bool:
+        ret = cols["ret"][i]
+        if not _finite(ret):
+            return False
+        return (side is Side.BUY and ret <= 0) or (side is Side.SELL and ret >= 0)
+
+
 ROUND2_STRATEGIES = {s.name: s for s in (ChannelBreakoutD1(), TimeSeriesMomentumD1(), BreakoutH4DailyFilter())}
+# Round 3 (crypto, pre-registered 12 Nov 2026): C1 is round 2's 4-hour rule unchanged; C2 is new.
+ROUND3_STRATEGIES = {s.name: s for s in (BreakoutH4DailyFilter(), TimeSeriesMomentumFastD1())}
 
 
 def prep_key(strategy, params: dict) -> str:
