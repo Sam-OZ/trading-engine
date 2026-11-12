@@ -11,7 +11,7 @@ Fill model (deliberately conservative):
 - Position size: risk_pct of current equity lost if the stop fills at its level.
 
 Walk-forward: parameters are chosen on a 12-month training window using only
-trades that ENTERED in that window, then judged on the next 3 months they have
+trades that ENTERED and EXITED in that window, then judged on the next 3 months they have
 never seen; the window rolls forward 3 months at a time. Gate 2 looks only at
 those unseen (out-of-sample) trades.
 """
@@ -58,12 +58,20 @@ class CostModel:
 
 # Defaults are deliberately a little worse than Capital.com's advertised typical spreads
 # and Binance's standard taker fee. Admin can override per symbol via settings.cost_model.
+# Round 2 (12 Nov 2026): funding raised from 3% to 6% a year, long or short, because the
+# round 2 strategies hold for weeks; these values may only ever go UP (pre-registered plan).
 DEFAULT_COSTS: dict[str, CostModel] = {
-    "EUR/USD": CostModel(spread=0.00010, slippage=0.00005, funding_annual=0.03),
-    "GBP/USD": CostModel(spread=0.00015, slippage=0.00005, funding_annual=0.03),
-    "USD/JPY": CostModel(spread=0.012, slippage=0.005, funding_annual=0.03),
-    "AUD/USD": CostModel(spread=0.00012, slippage=0.00005, funding_annual=0.03),
-    "USD/CAD": CostModel(spread=0.00018, slippage=0.00005, funding_annual=0.03),
+    "EUR/USD": CostModel(spread=0.00010, slippage=0.00005, funding_annual=0.06),
+    "GBP/USD": CostModel(spread=0.00015, slippage=0.00005, funding_annual=0.06),
+    "USD/JPY": CostModel(spread=0.012, slippage=0.005, funding_annual=0.06),
+    "AUD/USD": CostModel(spread=0.00012, slippage=0.00005, funding_annual=0.06),
+    "USD/CAD": CostModel(spread=0.00018, slippage=0.00005, funding_annual=0.06),
+    "USD/CHF": CostModel(spread=0.00018, slippage=0.00005, funding_annual=0.06),
+    "NZD/USD": CostModel(spread=0.00020, slippage=0.00005, funding_annual=0.06),
+    "EUR/GBP": CostModel(spread=0.00015, slippage=0.00005, funding_annual=0.06),
+    "EUR/JPY": CostModel(spread=0.020, slippage=0.005, funding_annual=0.06),
+    "GBP/JPY": CostModel(spread=0.030, slippage=0.008, funding_annual=0.06),
+    "XAU/USD": CostModel(spread=0.40, slippage=0.10, funding_annual=0.06),
     "BTC/USDT": CostModel(spread_bps=1.0, slippage_bps=2.0, commission_rate=0.001),
     "ETH/USDT": CostModel(spread_bps=1.5, slippage_bps=2.0, commission_rate=0.001),
     "SOL/USDT": CostModel(spread_bps=3.0, slippage_bps=4.0, commission_rate=0.001),
@@ -322,7 +330,9 @@ def walk_forward(
             break
         best, best_score, best_is = None, -math.inf, []
         for pid, trades in all_trades.items():
-            is_t = [t for t in trades if train_start <= pd.Timestamp(t.entry_time) < train_end]
+            # Only trades that also EXITED inside the training window: a trade still open at train_end
+            # would carry test-period prices into the parameter choice.
+            is_t = [t for t in trades if train_start <= pd.Timestamp(t.entry_time) and pd.Timestamp(t.exit_time) < train_end]
             if len(is_t) < min_is_trades:
                 continue
             score = (min(_pf(is_t), 10.0), sum(t.r for t in is_t))

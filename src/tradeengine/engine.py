@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 
-from .brokers.base import BrokerAdapter
+from .brokers.base import BrokerAdapter, BrokerError
 from .brokers.binance import BinanceSpotDemoAdapter
 from .brokers.capital import CapitalComAdapter
 from .config import InfraConfig
@@ -73,6 +73,7 @@ class Engine:
         self.bar_builder = MinuteBarBuilder()
         self.specs: dict[str, MarketSpec] = {}
         self.accounts: dict[Venue, AccountSnapshot] = {}
+        self.unavailable: dict[str, str] = {}  # symbol -> why the broker would not serve it at start-up
         self._tasks: list[asyncio.Task] = []
 
     def _build_adapters(self) -> dict[Venue, BrokerAdapter]:
@@ -91,7 +92,7 @@ class Engine:
         return out
 
     def active_instruments(self) -> list[Instrument]:
-        return [i for i in self.instruments.values() if i.venue in self.adapters]
+        return [i for i in self.instruments.values() if i.venue in self.adapters and i.symbol not in self.unavailable]
 
     # ------------------------------------------------------------------ lifecycle
     async def start(self) -> None:
@@ -100,8 +101,18 @@ class Engine:
             await a.connect()
             log.info("connected to %s", venue)
         for inst in self.active_instruments():
-            self.specs[inst.symbol] = await self.adapters[inst.venue].market_spec(inst)
-            self.ticks.update(await self.adapters[inst.venue].quote(inst))
+            try:
+                self.specs[inst.symbol] = await self.adapters[inst.venue].market_spec(inst)
+                self.ticks.update(await self.adapters[inst.venue].quote(inst))
+            except BrokerError as e:
+                if e.status not in (400, 404):
+                    raise  # network, login or rate trouble is not "instrument unknown": fail loudly
+                # One instrument the broker does not list (e.g. a wrong code) must not stop the engine:
+                # it is left out (no prices, no trades) and reported by `status` and `instruments`.
+                self.unavailable[inst.symbol] = str(e)
+                self.specs.pop(inst.symbol, None)
+                log.warning("%s left out: %s", inst.symbol, e)
+                await log_event(self.db, "WARNING", "engine", f"{inst.symbol} left out at start-up: {e}")
         await self.refresh_accounts()
         await self._add_conversion_feeds()
 

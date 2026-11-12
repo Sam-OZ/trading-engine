@@ -2,15 +2,18 @@
 
   status                  accounts, open positions, kill switch
   gate1 [--venue ...]     live demo checks (opens and closes small demo positions)
-  run                     market data + reconciler + equity tracking (strategies arrive in Phase 2)
+  run                     market data + reconciler + equity tracking + hourly strategy runner
   reconcile               one reconcile pass
   kill "reason" [--flatten]   engage the kill switch (and close all engine positions)
   unkill                  release the kill switch
   settings [--set k=v]    show or change admin settings
   download ...            historical data for one symbol
-  download-all            Phase 2 history for every allowed instrument (H1, ~3 years)
-  gate2                   walk-forward backtest of every strategy, Gate 2 verdict + report
-  gate2-apply <json>      switch on the strategies that passed (demo trading starts on the next hour)
+  download-all [--from 2013-01-01]   hourly history for every allowed instrument
+  instruments             check each instrument at the broker: code, sizes, live spread vs backtest cost
+  gate2                   round 1: walk-forward backtest of the hourly strategies, Gate 2 verdict + report
+  round2 --dev            round 2 development run (check 1) + frozen basket
+  round2 --holdout <dev result.json>   round 2 holdout (check 2): ONE run per strategy, ever
+  gate2-apply <json>      switch on the strategies that passed (Gate 2 or round 2 holdout result)
 """
 
 from __future__ import annotations
@@ -35,10 +38,9 @@ from .engine import Engine
 from .gate1 import Gate1, print_report, save_report
 from .history import (
     bars_to_frame,
-    download_dukascopy,
-    frame_to_bars,
+    download_dukascopy_h1,
     history_path,
-    resample_frame,
+    read_frame,
     write_bars,
 )
 from .models import DEFAULT_INSTRUMENTS, PositionStatus, Venue
@@ -61,6 +63,8 @@ async def cmd_status(_args) -> None:
         await eng.start()
         halted, why = await eng.state.is_halted()
         print(f"Kill switch: {'ENGAGED - ' + why if halted else 'off'}")
+        for sym, why_not in eng.unavailable.items():
+            print(f"Left out (broker does not serve it): {sym}: {why_not}")
         for v, a in eng.accounts.items():
             print(f"{v.value:<8} {a.currency} balance {a.balance:,.2f}  equity {a.equity:,.2f}  available {a.available:,.2f}")
         for v, ad in eng.adapters.items():
@@ -161,7 +165,7 @@ async def cmd_download(args) -> None:
     start = end - timedelta(days=args.days)
     inst = DEFAULT_INSTRUMENTS.get(args.symbol)
     if args.source == "dukascopy":
-        await _download_dukascopy(cfg, args.symbol, start, end)
+        await _download_dukascopy(cfg, args.symbol, start, end)  # always hourly
         return
     if inst is None:
         sys.exit(f"unknown symbol {args.symbol}; known: {', '.join(DEFAULT_INSTRUMENTS)}")
@@ -188,38 +192,63 @@ async def _download_broker(cfg, adapter, source: str, inst, tf: str, start, end)
         gaps.clear()
 
 
+def cross_check(existing, new, spread: float) -> tuple[int, float, float]:
+    """Overlapping hours, max close difference, share of hours differing by more than one spread."""
+    if existing is None or new is None or existing.empty or new.empty:
+        return 0, 0.0, 0.0
+    both = existing[["close"]].rename(columns={"close": "close_old"}).join(new[["close"]].rename(columns={"close": "close_new"}), how="inner")
+    if both.empty:
+        return 0, 0.0, 0.0
+    diff = (both["close_old"] - both["close_new"]).abs()
+    return len(both), float(diff.max()), float((diff > spread).mean())
+
+
 async def _download_dukascopy(cfg, symbol: str, start, end) -> None:
+    """Hourly Dukascopy history; checked against the hours already on disk before it is merged in."""
+    from .backtest import cost_for
+
     async with httpx.AsyncClient(timeout=30) as client:
-        bars = await download_dukascopy(client, symbol, start.date(), end.date() + timedelta(days=1))
-    m1 = history_path(cfg.data_dir, "dukascopy", symbol, "M1")
-    write_bars(m1, bars)
-    h1 = resample_frame(bars_to_frame(bars), "1h") if bars else None
-    n = write_bars(history_path(cfg.data_dir, "dukascopy", symbol, "H1"), frame_to_bars(h1, symbol, "H1")) if h1 is not None else 0
+        bars, stats = await download_dukascopy_h1(client, symbol, start.date(), end.date() + timedelta(days=1))
+    path = history_path(cfg.data_dir, "dukascopy", symbol, "H1")
     first = bars[0].open_time.date() if bars else None
-    print(f"  dukascopy {symbol:<9} M1: {len(bars):,} bars from {first}; H1 file {n:,} rows")
+    where = f"{stats['monthly']} monthly files, {stats['from_minutes']} month(s) from minute files"
+    n_overlap, max_diff, share = cross_check(read_frame(path), bars_to_frame(bars) if bars else None, cost_for(symbol).spread or 0.0)
+    check = ""
+    if n_overlap:
+        check = f"; matches the {n_overlap:,} hours already on disk (max close difference {max_diff:.5g})"
+        if share > 0.01:
+            print(f"  dukascopy {symbol:<9} NOT SAVED: {share:.1%} of the {n_overlap:,} overlapping hours differ from the file "
+                  f"on disk by more than one spread (max {max_diff:.5g}). Send this line to Claude.")
+            return
+    n = write_bars(path, bars)
+    print(f"  dukascopy {symbol:<9} H1: {len(bars):,} bars from {first} ({where}){check}; file {n:,} rows")
 
 
 async def cmd_download_all(args) -> None:
-    """History for every allowed instrument: Binance H1 (crypto); Capital.com H1 and Dukascopy (FX)."""
+    """Hourly history for every allowed instrument: Binance (crypto); Dukascopy + Capital.com (Forex, gold)."""
     logging.getLogger("httpx").setLevel(logging.WARNING)  # thousands of requests: print a summary line per file instead
     cfg = load_config()
     end = datetime.now(UTC)
-    start = end - timedelta(days=args.days)
+    start = datetime.fromisoformat(args.from_date).replace(tzinfo=UTC) if args.from_date else end - timedelta(days=args.days)
     eng = _engine()
     try:
         await eng.start()
         settings = await eng.settings_store.load()
-        for sym in settings.instruments:
+        from .round2 import ROUND2_SYMBOLS
+
+        for sym in dict.fromkeys([*settings.instruments, *ROUND2_SYMBOLS]):  # the round 2 basket even if not traded
             inst = DEFAULT_INSTRUMENTS.get(sym)
             if inst is None:
                 continue
             adapter = eng.adapters.get(inst.venue)
-            if adapter is not None:
+            if adapter is not None and sym not in eng.unavailable:
+                # Capital.com's demo API keeps only ~12 days of hourly prices: ask for 30, not years of empty windows.
+                b_start = max(start, end - timedelta(days=30)) if inst.venue is Venue.CAPITAL else start
                 try:
-                    await _download_broker(cfg, adapter, inst.venue.value, inst, "H1", start, end)
+                    await _download_broker(cfg, adapter, inst.venue.value, inst, "H1", b_start, end)
                 except Exception as e:
                     print(f"  {inst.venue.value:<9} {sym:<9} failed: {e}")
-            if inst.kind.value == "fx" and not args.no_dukascopy:
+            if inst.kind.value in ("fx", "metal") and not args.no_dukascopy:
                 try:
                     await _download_dukascopy(cfg, sym, start, end)
                 except Exception as e:
@@ -248,6 +277,115 @@ async def cmd_gate2(args) -> None:
     print(f"GATE 2: {', '.join(passed) + ' PASSED' if passed else 'no strategy passed'}")
 
 
+async def cmd_instruments(_args) -> None:
+    """Each instrument at its broker: code, dealing rules, live spread against the backtest's cost."""
+    from .backtest import cost_for
+
+    eng = _engine()
+    try:
+        await eng.start()
+        settings = await eng.settings_store.load()
+        from .round2 import ROUND2_SYMBOLS
+
+        for sym in dict.fromkeys([*settings.instruments, *ROUND2_SYMBOLS]):
+            inst = eng.instruments.get(sym) or DEFAULT_INSTRUMENTS.get(sym)
+            if inst is None:
+                print(f"{sym:<9} unknown symbol")
+                continue
+            if inst.venue not in eng.adapters:
+                print(f"{sym:<9} {inst.venue.value}: no keys loaded")
+                continue
+            if sym in eng.unavailable:
+                print(f"{sym:<9} {inst.venue.value} code {inst.broker_symbol}: NOT FOUND ({eng.unavailable[sym]})")
+                search = getattr(eng.adapters[inst.venue], "search_markets", None)
+                if search is not None:
+                    term = "gold" if inst.base == "XAU" else f"{inst.base}/{inst.quote}"
+                    for m in (await search(term))[:8]:
+                        print(f"            candidate: {m['epic']:<12} {m['instrumentName']} ({m['instrumentType']}, {m['marketStatus']})")
+                continue
+            spec, q = eng.specs[sym], eng.ticks.last.get(sym)
+            line = (f"{sym:<9} {inst.venue.value} code {inst.broker_symbol:<8} min size {spec.min_size} step {spec.size_step} "
+                    f"tick {spec.price_tick} lot {spec.contract_multiplier} {'tradeable' if spec.tradeable else 'NOT tradeable now'}")
+            if q is not None:
+                live = float(q.ask - q.bid)
+                c = cost_for(sym, settings.cost_model)
+                model = c.spread + float(q.mid) * c.spread_bps / 10000
+                verdict = "ok" if live <= model else "WIDER than the backtest cost: raise cost_model before the holdout"
+                line += f"; spread now {live:.6g} vs backtest {model:.6g} ({verdict})"
+            print(line)
+        print("\nOne spread reading is a snapshot; check at a busy hour (London/New York overlap), not at the daily roll-over.")
+    finally:
+        await eng.stop()
+
+
+async def cmd_round2(args) -> None:
+    from . import round2 as r2
+
+    cfg = load_config()
+    eng = _engine(need_brokers=False)
+    try:
+        await eng.db.create_all()
+        settings = await eng.settings_store.load()
+        fp = r2.fingerprint(settings)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        if args.dev:
+            n = await r2.count_dev_run(eng.db)
+            print(f"Round 2 development run #{n} (data to {r2.DEV_END:%Y-%m-%d}; this takes several minutes):")
+            runs, verdicts, notes = r2.run_dev(cfg.data_dir, settings, DEFAULT_INSTRUMENTS)
+            extra = [f"Development run number {n} (every run is counted)."]
+            md = r2.render("dev", runs, verdicts, notes, fp, extra, r2.Limits.from_settings(settings))
+            out = r2.save(cfg.data_dir / "reports" / f"round2-dev-{stamp}", md, r2.dev_payload(runs, verdicts, fp, n), runs)
+            print()
+            print(md)
+            print(f"\nReport folder: {out}")
+            passed = [r.strategy for r in runs if verdicts[r.strategy]["passed"]]
+            print(f"CHECK 1: {', '.join(passed) + ' passed - eligible for the holdout' if passed else 'no strategy passed; all stay off'}")
+            return
+        dev_path = Path(args.holdout)
+        dev = json.loads(dev_path.read_text())
+        if dev.get("kind") != "round2-dev":
+            sys.exit(f"{dev_path} is not a round 2 development result.json")
+        if dev.get("fingerprint") != fp:
+            sys.exit(f"Code or settings changed since that development run (fingerprint {dev.get('fingerprint')} then, {fp} now). "
+                     "Run `tradeengine round2 --dev` again first.")
+        eligible = [name for name, d in dev["strategies"].items() if d["passed"]]
+        if not eligible:
+            sys.exit("No strategy passed development, so there is nothing to run on the holdout. All strategies stay off.")
+        done = await r2.all_holdout_records(eng.db)
+        for name in eligible:
+            if name in done:
+                print(f"{name}: the holdout was already run on {done[name].get('run_at', '?')[:16]} "
+                      f"(report {done[name].get('report', '?')}). A second look is not allowed.")
+        todo = [n for n in eligible if n not in done]
+        if not todo:
+            sys.exit("Nothing left to run.")
+        print(f"HOLDOUT: one run, ever, for: {', '.join(todo)}. Baskets: "
+              + "; ".join(f"{n}: {', '.join(dev['strategies'][n]['basket']) or 'none'}" for n in todo))
+        if not args.yes and input("Type HOLDOUT to run it now: ").strip() != "HOLDOUT":
+            sys.exit("Not run.")
+        dev_todo = {**dev, "strategies": {n: d for n, d in dev["strategies"].items() if n in todo}}
+        runs, verdicts, notes = r2.run_holdout(cfg.data_dir, settings, DEFAULT_INSTRUMENTS, dev_todo)
+        out_dir = cfg.data_dir / "reports" / f"round2-holdout-{stamp}"
+        for run in runs:  # recorded BEFORE anything is shown, so the result cannot be looked at and re-rolled
+            v = verdicts[run.strategy]
+            await r2.record_holdout(eng.db, run.strategy, {
+                "fingerprint": fp, "run_at": datetime.now(UTC).isoformat(), "passed": v["passed"], "reasons": v["reasons"],
+                "basket": v["basket"], "trades": run.metrics.trades, "profit_factor": run.metrics.profit_factor,
+                "max_drawdown_pct": run.metrics.max_drawdown_pct, "report": str(out_dir), "dev_result": str(dev_path),
+            })
+        md = r2.render("holdout", runs, verdicts, notes, fp, [f"Development result: `{dev_path}`"], r2.Limits.from_settings(settings))
+        out = r2.save(out_dir, md, r2.holdout_payload(runs, verdicts, fp, str(dev_path)), runs)
+        print()
+        print(md)
+        print(f"\nReport folder: {out}")
+        passed = [r.strategy for r in runs if verdicts[r.strategy]["passed"]]
+        print(f"CHECK 2: {', '.join(passed) + ' PASSED' if passed else 'no strategy passed; all stay off'}")
+        if passed:
+            print(f"To switch on for demo trading: uv run tradeengine gate2-apply {out / 'result.json'} --dry-run")
+    finally:
+        await eng.stop()
+
+
 async def cmd_gate2_apply(args) -> None:
     """Enable the strategies that passed Gate 2, on their eligible instruments, with the latest window's parameters."""
     data = json.loads(Path(args.result).read_text())
@@ -262,10 +400,14 @@ async def cmd_gate2_apply(args) -> None:
         if args.dry_run:
             print(json.dumps({"strategies_enabled": enabled, "strategy_params": params}, indent=2))
             return
-        await eng.settings_store.update({"strategies_enabled": enabled, "strategy_params": params}, "gate2-apply")
-        print("Enabled:" if enabled else "Nothing passed Gate 2: all strategies stay off.")
+        settings = await eng.settings_store.update({"strategies_enabled": enabled, "strategy_params": params}, "gate2-apply")
+        print("Enabled:" if enabled else "Nothing passed: all strategies stay off.")
         for s, syms in enabled.items():
             print(f"  {s}: {', '.join(syms)}")
+        missing = sorted({sym for syms in enabled.values() for sym in syms} - set(settings.instruments))
+        if missing:
+            print(f"WARNING: not on the allowed instrument list, so the risk manager will refuse them: {', '.join(missing)}. "
+                  "Add them with `tradeengine settings --set instruments='[...]'`.")
     finally:
         await eng.stop()
 
@@ -292,8 +434,15 @@ def main(argv: list[str] | None = None) -> None:
     d.add_argument("--days", type=int, default=30)
     da = sub.add_parser("download-all")
     da.add_argument("--days", type=int, default=1100)
+    da.add_argument("--from", dest="from_date", metavar="YYYY-MM-DD", help="start date (overrides --days)")
     da.add_argument("--no-dukascopy", action="store_true")
+    sub.add_parser("instruments")
     sub.add_parser("gate2")
+    r2p = sub.add_parser("round2")
+    mode = r2p.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--dev", action="store_true", help="development run (check 1)")
+    mode.add_argument("--holdout", metavar="DEV_RESULT_JSON", help="the one holdout run (check 2)")
+    r2p.add_argument("--yes", action="store_true", help="skip the HOLDOUT confirmation")
     ga = sub.add_parser("gate2-apply")
     ga.add_argument("result", help="data/reports/gate2-.../result.json")
     ga.add_argument("--dry-run", action="store_true")
@@ -308,7 +457,9 @@ def main(argv: list[str] | None = None) -> None:
         "settings": cmd_settings,
         "download": cmd_download,
         "download-all": cmd_download_all,
+        "instruments": cmd_instruments,
         "gate2": cmd_gate2,
+        "round2": cmd_round2,
         "gate2-apply": cmd_gate2_apply,
     }[args.cmd]
     asyncio.run(handler(args))

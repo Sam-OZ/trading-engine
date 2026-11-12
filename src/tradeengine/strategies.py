@@ -40,7 +40,8 @@ class Signal:
     reason: str
     trail_atr: float | None = None  # trail by this many ATR once the trade is +1R
     breakeven_at_r: float | None = None  # move stop to entry at this R
-    max_bars: int = 72  # time exit (H1 bars)
+    max_bars: int | None = 72  # time exit (bars of the strategy's timeframe); None = no time exit
+    trail_activate_r: float = 1.0  # the ATR trail starts once the trade is this many R in profit (0 = at once)
 
 
 @dataclass(frozen=True)
@@ -135,7 +136,7 @@ class TrendPullback:
     default_params: dict = field(default_factory=lambda: {"stop_atr": 1.5, "target_r": 2.0, "rsi_pull": 45, "trail_atr": 2.0, "max_bars": 72})
     grid: dict = field(default_factory=lambda: {"stop_atr": [1.0, 1.5, 2.0], "target_r": [2.0, 3.0], "rsi_pull": [40, 45], "trail_atr": [2.0], "max_bars": [72]})
 
-    def prepare(self, h1: pd.DataFrame, params: dict) -> pd.DataFrame:
+    def prepare(self, h1: pd.DataFrame, params: dict, **_) -> pd.DataFrame:
         return build_frame(h1)
 
     def signal_at(self, cols, i, p, allow_short):
@@ -168,7 +169,7 @@ class MeanReversion:
     default_params: dict = field(default_factory=lambda: {"bb_std": 2.0, "rsi_low": 30, "stop_atr": 1.5, "max_bars": 24})
     grid: dict = field(default_factory=lambda: {"bb_std": [2.0, 2.5], "rsi_low": [25, 30], "stop_atr": [1.5, 2.0], "max_bars": [24]})
 
-    def prepare(self, h1: pd.DataFrame, params: dict) -> pd.DataFrame:
+    def prepare(self, h1: pd.DataFrame, params: dict, **_) -> pd.DataFrame:
         return build_frame(h1, bb_std=params["bb_std"])
 
     def signal_at(self, cols, i, p, allow_short):
@@ -197,7 +198,7 @@ class VolatilityBreakout:
     default_params: dict = field(default_factory=lambda: {"dc_n": 20, "stop_atr": 1.5, "target_r": 4.0, "trail_atr": 2.0, "squeeze_pct": 0.2, "vol_mult": 1.2, "max_bars": 96})
     grid: dict = field(default_factory=lambda: {"dc_n": [20, 40], "stop_atr": [1.5, 2.0], "target_r": [4.0], "trail_atr": [2.0, 3.0], "squeeze_pct": [0.2], "vol_mult": [1.2], "max_bars": [96]})
 
-    def prepare(self, h1: pd.DataFrame, params: dict) -> pd.DataFrame:
+    def prepare(self, h1: pd.DataFrame, params: dict, **_) -> pd.DataFrame:
         return build_frame(h1, dc_n=params["dc_n"])
 
     def signal_at(self, cols, i, p, allow_short):
@@ -227,16 +228,16 @@ STRATEGIES: dict[str, Strategy] = {s.name: s for s in (TrendPullback(), MeanReve
 # ---------------------------------------------------------------------------------- trade management
 def trailed_stop(
     side: Side, entry: float, stop: float, initial_risk: float, best_close: float, atr: float,
-    trail_atr: float | None, breakeven_at_r: float | None,
+    trail_atr: float | None, breakeven_at_r: float | None, activate_r: float = 1.0,
 ) -> float:
-    """New stop after a bar closes. Only ever tightens. Shared by backtester and live runner."""
+    """New stop after a bar closes. Only ever tightens. Shared by backtesters and live runner."""
     new = stop
     if not _finite(atr) or initial_risk <= 0:
         return new
     gain = (best_close - entry) if side is Side.BUY else (entry - best_close)
     if breakeven_at_r is not None and gain >= breakeven_at_r * initial_risk:
         new = max(new, entry) if side is Side.BUY else min(new, entry)
-    if trail_atr is not None and gain >= initial_risk:
+    if trail_atr is not None and gain >= activate_r * initial_risk:
         trail = best_close - trail_atr * atr if side is Side.BUY else best_close + trail_atr * atr
         new = max(new, trail) if side is Side.BUY else min(new, trail)
     return new

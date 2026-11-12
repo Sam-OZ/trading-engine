@@ -194,6 +194,14 @@ class CapitalComAdapter:
             available=Decimal(str(b.get("available", balance))),
         )
 
+    async def search_markets(self, term: str) -> list[dict]:
+        """Markets whose name matches `term`: [{epic, instrumentName, instrumentType, marketStatus}, ...]."""
+        body = await self._request("GET", "/api/v1/markets", params={"searchTerm": term})
+        return [
+            {k: m.get(k) for k in ("epic", "instrumentName", "instrumentType", "marketStatus")}
+            for m in body.get("markets", [])
+        ]
+
     async def market_details(self, inst: Instrument) -> dict:
         return await self._request("GET", f"/api/v1/markets/{inst.broker_symbol}")
 

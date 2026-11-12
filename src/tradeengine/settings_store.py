@@ -31,7 +31,10 @@ class RuntimeSettings(BaseModel):
     stale_data_seconds: int = Field(60, ge=5, le=3600)
     weekend_fx_flatten: bool = True
     fx_no_new_entries_hours_before_close: int = Field(2, ge=0, le=24)
-    instruments: list[str] = ["EUR/USD", "GBP/USD", "USD/JPY", "BTC/USDT", "ETH/USDT"]
+    instruments: list[str] = [
+        "EUR/USD", "GBP/USD", "USD/JPY", "AUD/USD", "USD/CAD", "USD/CHF", "NZD/USD", "EUR/GBP", "EUR/JPY", "GBP/JPY",
+        "XAU/USD", "BTC/USDT", "ETH/USDT",
+    ]
     reconcile_interval_seconds: int = Field(30, ge=5, le=600)
 
     # --- Strategies (all OFF until they pass Gate 2; set with `tradeengine gate2-apply`) ---
@@ -47,6 +50,18 @@ class RuntimeSettings(BaseModel):
     gate2_symbol_min_trades: int = Field(30, ge=1)
     walk_forward_train_months: int = Field(12, ge=3, le=36)
     walk_forward_test_months: int = Field(3, ge=1, le=12)
+    # Round 2 walk-forward, per strategy: [training months, test months] (pre-registered 12 Nov 2026)
+    round2_walk_forward: dict[str, list[int]] = {
+        "channel_breakout_d1": [36, 6], "tsmom_d1": [36, 6], "breakout_h4_dfilter": [24, 6],
+    }
+
+    @field_validator("round2_walk_forward")
+    @classmethod
+    def _wf(cls, v: dict[str, list[int]]) -> dict[str, list[int]]:
+        for name, pair in v.items():
+            if len(pair) != 2 or not (6 <= pair[0] <= 60 and 1 <= pair[1] <= 12):
+                raise ValueError(f"{name}: needs [training months 6-60, test months 1-12]")
+        return v
 
     # --- Claude reviewer ---
     claude_review_enabled: bool = True

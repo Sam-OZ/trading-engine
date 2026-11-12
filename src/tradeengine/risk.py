@@ -125,7 +125,7 @@ def evaluate(intent: TradeIntent, inst: Instrument, ctx: RiskContext) -> RiskDec
     if age is None or age > s.stale_data_seconds:
         return d.reject(f"market data stale for {inst.symbol}")
 
-    if inst.kind in (AssetKind.FX,):
+    if inst.kind in (AssetKind.FX, AssetKind.METAL):
         ok, why = fx_market_state(ctx.now, s.fx_no_new_entries_hours_before_close)
         if not ok:
             return d.reject(why)
@@ -155,9 +155,9 @@ def evaluate(intent: TradeIntent, inst: Instrument, ctx: RiskContext) -> RiskDec
     same = sum(1 for p in ctx.open_positions if p.symbol == inst.symbol)
     if same >= s.max_positions_per_instrument:
         return d.reject(f"already holding {inst.symbol}")
-    if inst.kind is AssetKind.FX:
+    if inst.kind in (AssetKind.FX, AssetKind.METAL):
         for ccy in inst.currencies:
-            n = sum(1 for p in ctx.open_positions if p.kind is AssetKind.FX and ccy in p.currencies)
+            n = sum(1 for p in ctx.open_positions if p.kind in (AssetKind.FX, AssetKind.METAL) and ccy in p.currencies)
             if n >= s.max_positions_per_currency:
                 return d.reject(f"already {n} open positions in {ccy} (max {s.max_positions_per_currency})")
 

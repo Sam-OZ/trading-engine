@@ -26,6 +26,7 @@ class AssetKind(StrEnum):
     FX = "fx"  # Forex CFD (Capital.com)
     CRYPTO_CFD = "crypto_cfd"  # crypto CFD (Capital.com): can short, no coins held
     CRYPTO_SPOT = "crypto_spot"  # real coins (Binance): long-only
+    METAL = "metal"  # gold CFD (Capital.com): Forex hours and limits, quoted in USD
 
 
 class Source(StrEnum):
@@ -62,13 +63,23 @@ class Instrument:
         return (self.base, self.quote)
 
 
-# Phase 1 starting instruments. AUD/USD, USD/CAD and SOL/USDT are added after Phase 3.
+# The round 2 basket (13 instruments, pre-registered 12 Nov 2026): 10 Forex pairs and gold on
+# Capital.com, BTC and ETH spot on Binance. Capital.com codes ("epics") are checked against the
+# broker with `tradeengine instruments`; one Capital.com does not list is left out at start-up.
 DEFAULT_INSTRUMENTS: dict[str, Instrument] = {
     i.symbol: i
     for i in (
         Instrument("EUR/USD", Venue.CAPITAL, "EURUSD", AssetKind.FX, "EUR", "USD"),
         Instrument("GBP/USD", Venue.CAPITAL, "GBPUSD", AssetKind.FX, "GBP", "USD"),
         Instrument("USD/JPY", Venue.CAPITAL, "USDJPY", AssetKind.FX, "USD", "JPY"),
+        Instrument("AUD/USD", Venue.CAPITAL, "AUDUSD", AssetKind.FX, "AUD", "USD"),
+        Instrument("USD/CAD", Venue.CAPITAL, "USDCAD", AssetKind.FX, "USD", "CAD"),
+        Instrument("USD/CHF", Venue.CAPITAL, "USDCHF", AssetKind.FX, "USD", "CHF"),
+        Instrument("NZD/USD", Venue.CAPITAL, "NZDUSD", AssetKind.FX, "NZD", "USD"),
+        Instrument("EUR/GBP", Venue.CAPITAL, "EURGBP", AssetKind.FX, "EUR", "GBP"),
+        Instrument("EUR/JPY", Venue.CAPITAL, "EURJPY", AssetKind.FX, "EUR", "JPY"),
+        Instrument("GBP/JPY", Venue.CAPITAL, "GBPJPY", AssetKind.FX, "GBP", "JPY"),
+        Instrument("XAU/USD", Venue.CAPITAL, "GOLD", AssetKind.METAL, "XAU", "USD"),
         Instrument("BTC/USDT", Venue.BINANCE, "BTCUSDT", AssetKind.CRYPTO_SPOT, "BTC", "USDT"),
         Instrument("ETH/USDT", Venue.BINANCE, "ETHUSDT", AssetKind.CRYPTO_SPOT, "ETH", "USDT"),
     )

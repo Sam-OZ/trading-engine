@@ -30,25 +30,52 @@ _REC = struct.Struct(">IIIIIf")
 
 
 def dukascopy_point(symbol: str) -> int:
-    """Price scale: JPY-quoted pairs use 3 decimals, other FX pairs 5."""
-    return 1000 if symbol.upper().endswith("JPY") else 100000
+    """Price scale: JPY-quoted pairs and gold use 3 decimals, other FX pairs 5.
+
+    A wrong scale is caught by `check_price_range` (prices 10x or 100x off), not silently used.
+    """
+    s = symbol.upper().replace("/", "")
+    return 1000 if s.endswith("JPY") or s.startswith("XAU") else 100000
+
+
+# Loose sanity ranges for 2010-2030 prices: a wrong decimal scale lands 10x or 100x outside them.
+PRICE_RANGES: dict[str, tuple[float, float]] = {
+    "EUR/USD": (0.8, 1.7), "GBP/USD": (1.0, 2.2), "USD/JPY": (70, 200), "AUD/USD": (0.5, 1.2), "USD/CAD": (0.9, 1.7),
+    "USD/CHF": (0.6, 1.3), "NZD/USD": (0.45, 1.0), "EUR/GBP": (0.65, 1.0), "EUR/JPY": (90, 220), "GBP/JPY": (110, 260),
+    "XAU/USD": (900, 9000),
+}
+
+
+def check_price_range(symbol: str, bars: list[Bar]) -> None:
+    rng = PRICE_RANGES.get(symbol)
+    if rng is None or not bars:
+        return
+    closes = sorted(float(b.close) for b in bars)
+    median = closes[len(closes) // 2]
+    if not (rng[0] <= median <= rng[1]):
+        raise ValueError(f"{symbol}: median price {median:g} outside {rng[0]:g}-{rng[1]:g}; the Dukascopy price scale is wrong")
 
 
 def decode_dukascopy_candles(raw: bytes, day: date, symbol: str) -> list[Bar]:
+    """One day of minute candles."""
+    return decode_candles(raw, datetime(day.year, day.month, day.day, tzinfo=UTC), symbol, "M1")
+
+
+def decode_candles(raw: bytes, base: datetime, symbol: str, timeframe: str) -> list[Bar]:
+    """Dukascopy candle file: records are (seconds from `base`, open, close, low, high, volume)."""
     if not raw:
         return []  # weekend / holiday
     data = lzma.decompress(raw)
     if len(data) % _REC.size:
-        raise ValueError(f"Dukascopy record size mismatch for {symbol} {day}")
+        raise ValueError(f"Dukascopy record size mismatch for {symbol} {base:%Y-%m-%d}")
     scale = Decimal(dukascopy_point(symbol))
-    base = datetime(day.year, day.month, day.day, tzinfo=UTC)
     bars = []
     for off, o, c, lo, hi, vol in _REC.iter_unpack(data):
         if vol == 0 and o == c == lo == hi:
-            continue  # Dukascopy pads quiet minutes with flat zero-volume candles
+            continue  # Dukascopy pads quiet periods with flat zero-volume candles
         bar = Bar(
             symbol=symbol,
-            timeframe="M1",
+            timeframe=timeframe,
             open_time=base + timedelta(seconds=off),
             open=Decimal(o) / scale,
             high=Decimal(hi) / scale,
@@ -92,6 +119,79 @@ async def download_dukascopy(
     for bars in await asyncio.gather(*(one(d) for d in days)):
         out.extend(bars)
     return out
+
+
+def _month_starts(start: date, end: date) -> list[date]:
+    out, d = [], date(start.year, start.month, 1)
+    while d < end:
+        out.append(d)
+        d = date(d.year + (d.month == 12), d.month % 12 + 1, 1)
+    return out
+
+
+async def download_dukascopy_h1(
+    client: httpx.AsyncClient, symbol: str, start: date, end: date, concurrency: int = 8, retries: int = 3, today: date | None = None,
+) -> tuple[list[Bar], dict[str, int]]:
+    """Hourly BID candles for [start, end), one request per month where Dukascopy has a monthly
+    file of hourly candles; otherwise (404, or a file that fails the checks) the month is built from
+    its minute files. The current month always comes from minute files (its monthly file is partial).
+    Returns (bars, {"monthly": n, "from_minutes": n}).
+    """
+    import asyncio
+
+    code = symbol.replace("/", "").upper()
+    today = today or datetime.now(UTC).date()
+    sem = asyncio.Semaphore(concurrency)
+    stats = {"monthly": 0, "from_minutes": 0}
+
+    async def get(url: str) -> httpx.Response | None:
+        for attempt in range(retries):
+            async with sem:
+                try:
+                    r = await client.get(url)
+                except httpx.TransportError:
+                    await asyncio.sleep(1 + attempt)
+                    continue
+            if r.status_code in (200, 404):
+                return r
+            await asyncio.sleep(1 + attempt)
+        raise RuntimeError(f"Dukascopy {url}: failed after {retries} attempts")
+
+    msem = asyncio.Semaphore(4)  # months in flight; a month built from minute files runs its own 8 requests
+
+    async def month(m0: date) -> list[Bar]:
+        async with msem:
+            return await _month(m0)
+
+    async def _month(m0: date) -> list[Bar]:
+        m1 = date(m0.year + (m0.month == 12), m0.month % 12 + 1, 1)
+        current = m0 <= today < m1
+        if not current:
+            r = await get(f"{DUKASCOPY_URL}/{code}/{m0.year}/{m0.month - 1:02d}/BID_candles_hour_1.bi5")
+            if r is not None and r.status_code == 200:
+                base = datetime(m0.year, m0.month, 1, tzinfo=UTC)
+                try:
+                    bars = decode_candles(r.content, base, symbol, "H1")
+                    ok = all(b.open_time.minute == 0 and b.open_time.second == 0 and b.open_time < datetime(m1.year, m1.month, 1, tzinfo=UTC)
+                             for b in bars)
+                except (ValueError, lzma.LZMAError):
+                    ok = False
+                if ok:
+                    stats["monthly"] += 1
+                    return bars
+        stats["from_minutes"] += 1
+        last = min(m1, end, today + timedelta(days=1))
+        first = max(m0, start)
+        minutes = await download_dukascopy(client, symbol, first, last, concurrency=concurrency, retries=retries) if last > first else []
+        if not minutes:
+            return []
+        return frame_to_bars(resample_frame(bars_to_frame(minutes), "1h"), symbol, "H1")
+
+    out: list[Bar] = []
+    for bars in await asyncio.gather(*(month(m) for m in _month_starts(start, end))):
+        out.extend(b for b in bars if start <= b.open_time.date() < end)
+    check_price_range(symbol, out)
+    return out, stats
 
 
 def bars_to_frame(bars: list[Bar]) -> pd.DataFrame:

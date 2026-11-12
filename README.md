@@ -35,13 +35,16 @@ src/tradeengine/
   brokers/binance.py Binance Spot Demo Mode (orders) + live public data (signals)
   engine.py          wiring and the trade path
   indicators.py      EMA, RSI, ATR, ADX, MACD, Bollinger, Donchian (match TA-Lib)
-  strategies.py      trend pullback, mean reversion, volatility breakout (one code path, live + backtest)
-  backtest.py        fill model with costs, metrics, walk-forward, Gate 2 report
-  runner.py          hourly live runner: signals + breakeven/trail/time exit (off until gate2-apply)
+  strategies.py      round 1: trend pullback, mean reversion, volatility breakout on hourly bars
+  trend.py           round 2: daily channel breakout, daily time-series momentum, 4-hour breakout with daily filter
+  backtest.py        fill model with costs, metrics, round 1 walk-forward, Gate 2 report
+  portfolio.py       portfolio backtest: all instruments together through the live risk limits
+  round2.py          round 2 development/holdout runs, frozen basket, one-look holdout lock
+  runner.py          hourly live runner: signals + trail/exits on each strategy's own bars (off until gate2-apply)
   gate1.py           live demo checks for Gate 1
   cli.py             `tradeengine` command
 tests/               unit tests (no network; brokers are mocked)
-scripts/             with-secrets.sh, gate1.sh, phase2.sh
+scripts/             with-secrets.sh, gate1.sh, phase2.sh, round2.sh
 ```
 
 ## One-time setup on your Mac
@@ -70,7 +73,7 @@ scripts/             with-secrets.sh, gate1.sh, phase2.sh
    pre-commit install
    ```
 
-4. In the Capital.com platform, set the demo account balance to 10,000. (Binance Demo
+4. In the Capital.com platform, set the demo account balance (11,000 AUD in use since 12 Nov 2026). (Binance Demo
    Mode starts at 5,000 USDT and cannot be changed; the engine trades a virtual balance set by
    `binance_virtual_capital`, default 5,000.)
 
@@ -89,7 +92,9 @@ kill switch. Forex checks are skipped while the FX market is closed (Friday 17:0
 to Sunday 17:00 New York time); run it on a weekday for the full set. The report is
 saved to `data/reports/`.
 
-## Phase 2: backtest and Gate 2
+## Phase 2: backtest and Gate 2 (round 1, hourly strategies)
+
+First run 12 Nov 2026: no strategy passed, so all stay off. Kept for reference; round 2 below replaces it.
 
 ```bash
 cd ~/Downloads/Source_Code/Crypto_Forex
@@ -116,6 +121,41 @@ same code the backtest used (signal at the hour close, entry at the next open, b
 stop, breakeven at 1R, ATR trail, time exit). Thresholds, costs and walk-forward lengths
 are admin settings (`gate2_*`, `cost_model`, `walk_forward_*`).
 
+## Round 2: slower trend-following, pre-registered (12 Nov 2026)
+
+The plan (hypotheses, grids, instruments, costs, pass criteria) was written and approved before any
+round 2 result existed. The constants in `src/tradeengine/round2.py` are that plan: do not change them
+after seeing a result.
+
+```bash
+cd ~/Downloads/Source_Code/Crypto_Forex
+./scripts/round2.sh
+```
+
+1. `tradeengine instruments` checks every instrument at the broker (Capital.com code, minimum size,
+   price step, and the live spread against the backtest's cost). An instrument Capital.com does not list
+   is left out, with candidate codes printed. A spread wider than the backtest cost means raising
+   `cost_model` before the holdout (costs may only go up).
+2. `download-all --from 2013-01-01` fetches hourly history: Dukascopy for Forex and gold (monthly files,
+   checked against the hours already on disk), Binance for crypto, Capital.com's last 30 days.
+3. `round2 --dev` is the development run (check 1). Data is cut at 1 Nov 2023 before anything is computed.
+   Per instrument, walk-forward picks parameters (36/6 months daily, 24/6 months 4-hour) from trades that
+   entered and exited inside training, or sits the window out if the best training profit factor is below 1.0.
+   Then every instrument is replayed together through the live limits. Pass: PF >= 1.2, worst-account
+   drawdown < 10%, >= 200 trades. The holdout basket is frozen here (>= 30 trades and PF >= 1.0).
+
+The holdout is one deliberate run, after reading the development report:
+
+```bash
+uv run tradeengine round2 --holdout data/reports/round2-dev-<time>/result.json
+```
+
+It runs only strategies that passed development, only on their frozen basket, 1 Nov 2023 to
+31 Oct 2026, and asks you to type HOLDOUT. Each strategy's run is recorded with a fingerprint of the
+code and settings before the result is shown; a second run is refused, and so is a development result
+made with different code or settings. Pass: PF >= 1.2, drawdown < 10%, >= 100 trades. A pass is switched
+on for demo with `gate2-apply` on the holdout's `result.json`.
+
 ## Everyday commands
 
 ```bash
@@ -126,8 +166,9 @@ uv run tradeengine kill "reason"            # blocks new orders
 uv run tradeengine unkill
 uv run tradeengine settings
 uv run tradeengine settings --set risk_per_trade_pct=0.4 away_mode=false
-./scripts/with-secrets.sh uv run tradeengine download-all --days 1100
-uv run tradeengine gate2
+./scripts/with-secrets.sh uv run tradeengine instruments
+./scripts/with-secrets.sh uv run tradeengine download-all --from 2013-01-01
+uv run tradeengine round2 --dev
 ```
 
 The kill switch also engages if the file `data/KILL` exists.
