@@ -18,7 +18,9 @@ from .db import Database, SettingRow
 
 class RuntimeSettings(BaseModel):
     # --- Engine-wide risk ---
-    starting_capital_per_venue: Decimal = Field(Decimal("10000"), gt=0)
+    # Binance Demo Mode starts every account at 5,000 USDT and cannot be set to another amount,
+    # so the engine trades a virtual balance of this size on it (Capital.com uses its real balance).
+    binance_virtual_capital: Decimal = Field(Decimal("5000"), gt=0)
     risk_per_trade_pct: Decimal = Field(Decimal("0.5"), gt=0, le=2)
     daily_loss_limit_pct: Decimal = Field(Decimal("2.0"), gt=0, le=10)
     max_drawdown_pct: Decimal = Field(Decimal("10.0"), gt=0, le=50)
@@ -31,6 +33,20 @@ class RuntimeSettings(BaseModel):
     fx_no_new_entries_hours_before_close: int = Field(2, ge=0, le=24)
     instruments: list[str] = ["EUR/USD", "GBP/USD", "USD/JPY", "BTC/USDT", "ETH/USDT"]
     reconcile_interval_seconds: int = Field(30, ge=5, le=600)
+
+    # --- Strategies (all OFF until they pass Gate 2; set with `tradeengine gate2-apply`) ---
+    strategies_enabled: dict[str, list[str]] = {}  # strategy -> symbols it may trade
+    strategy_params: dict[str, dict[str, dict]] = {}  # strategy -> symbol -> chosen parameters
+
+    # --- Backtest / Gate 2 ---
+    cost_model: dict[str, dict[str, float]] = {}  # per-symbol overrides of backtest.DEFAULT_COSTS
+    gate2_min_pf: Decimal = Field(Decimal("1.2"), gt=0)
+    gate2_max_dd_pct: Decimal = Field(Decimal("10"), gt=0)
+    gate2_min_trades: int = Field(200, ge=1)
+    gate2_symbol_min_pf: Decimal = Field(Decimal("1.0"), gt=0)
+    gate2_symbol_min_trades: int = Field(30, ge=1)
+    walk_forward_train_months: int = Field(12, ge=3, le=36)
+    walk_forward_test_months: int = Field(3, ge=1, le=12)
 
     # --- Claude reviewer ---
     claude_review_enabled: bool = True

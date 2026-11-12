@@ -131,7 +131,7 @@ class Gate1:
         c = self._add("C4", "Live price stream")
         if fx_open:
             n = await self._run(c, self._collect_quotes(v, 20))
-            c.detail = f"{n} quotes in 20 s, reconnects {getattr(a, 'stream_connects', '?')}"
+            c.detail = f"{n} quotes in 20 s over {getattr(a, 'stream_connects', '?')} connection(s)"
             if not n:
                 c.status = "FAIL"
         else:
@@ -232,7 +232,7 @@ class Gate1:
         c = self._add("B1", "Binance Demo Mode account")
         acct = await self._run(c, a.account())
         if acct:
-            c.detail = f"USDT {acct.balance}, equity {acct.equity:.2f}, free {acct.available}"
+            c.detail = f"USDT {acct.balance:,.2f}, equity {acct.equity:,.2f}, free {acct.available:,.2f}"
 
         c = self._add("B2", "BTC/USDT exchange filters")
         spec = await self._run(c, a.market_spec(inst))
@@ -261,7 +261,7 @@ class Gate1:
 
         q = await a.quote(inst)
         e.ticks.update(q)
-        await e.refresh_accounts()  # virtual $10,000 for Binance
+        await e.refresh_accounts()  # virtual balance for Binance (setting binance_virtual_capital)
         intent = TradeIntent(
             symbol=inst.symbol, side=Side.BUY, entry=q.ask, stop=(q.bid * Decimal("0.99")), target=(q.ask * Decimal("1.01")),
             source=Source.STRATEGY, strategy="gate1", signal_time=datetime.now(UTC), reason="Gate 1 check", size_factor=Decimal("0.05"),

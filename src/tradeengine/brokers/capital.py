@@ -105,6 +105,7 @@ class CapitalComAdapter:
         self._confirm_attempts = confirm_attempts
         self._confirm_delay = confirm_delay
         self.session_renewals = 0
+        self.history_gaps: list[tuple] = []
 
     def add_instrument(self, inst: Instrument) -> None:
         if inst.venue is Venue.CAPITAL:
@@ -225,11 +226,20 @@ class CapitalComAdapter:
         cursor = start
         while cursor < end:
             stop = min(end, cursor + window)
-            body = await self._request(
-                "GET",
-                f"/api/v1/prices/{inst.broker_symbol}",
-                params={"resolution": res, "max": 1000, "from": _fmt_time(cursor), "to": _fmt_time(stop)},
-            )
+            try:
+                body = await self._request(
+                    "GET",
+                    f"/api/v1/prices/{inst.broker_symbol}",
+                    params={"resolution": res, "max": 1000, "from": _fmt_time(cursor), "to": _fmt_time(stop)},
+                )
+            except BrokerError as e:
+                # Capital.com answers 400/404 for windows older than it keeps (or with no prices,
+                # e.g. a weekend): skip the window and carry on rather than lose the whole download.
+                if e.status in (400, 404):
+                    self.history_gaps.append((cursor, stop, str(e)))
+                    cursor = stop
+                    continue
+                raise
             for p in body.get("prices", []):
                 t = _parse_utc(p.get("snapshotTimeUTC") or p["snapshotTime"])
                 bars[t] = Bar(

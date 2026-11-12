@@ -34,10 +34,14 @@ src/tradeengine/
   brokers/capital.py Capital.com demo REST + WebSocket
   brokers/binance.py Binance Spot Demo Mode (orders) + live public data (signals)
   engine.py          wiring and the trade path
+  indicators.py      EMA, RSI, ATR, ADX, MACD, Bollinger, Donchian (match TA-Lib)
+  strategies.py      trend pullback, mean reversion, volatility breakout (one code path, live + backtest)
+  backtest.py        fill model with costs, metrics, walk-forward, Gate 2 report
+  runner.py          hourly live runner: signals + breakeven/trail/time exit (off until gate2-apply)
   gate1.py           live demo checks for Gate 1
   cli.py             `tradeengine` command
 tests/               unit tests (no network; brokers are mocked)
-scripts/             with-secrets.sh, gate1.sh
+scripts/             with-secrets.sh, gate1.sh, phase2.sh
 ```
 
 ## One-time setup on your Mac
@@ -67,7 +71,8 @@ scripts/             with-secrets.sh, gate1.sh
    ```
 
 4. In the Capital.com platform, set the demo account balance to 10,000. (Binance Demo
-   Mode keeps its own default balances; the engine trades a virtual 10,000 USDT of it.)
+   Mode starts at 5,000 USDT and cannot be changed; the engine trades a virtual balance set by
+   `binance_virtual_capital`, default 5,000.)
 
 ## Gate 1: live demo checks
 
@@ -84,6 +89,33 @@ kill switch. Forex checks are skipped while the FX market is closed (Friday 17:0
 to Sunday 17:00 New York time); run it on a weekday for the full set. The report is
 saved to `data/reports/`.
 
+## Phase 2: backtest and Gate 2
+
+```bash
+cd ~/Downloads/Source_Code/Crypto_Forex
+./scripts/phase2.sh
+```
+
+Downloads about 3 years of hourly bars (Binance for crypto; Capital.com and Dukascopy for
+Forex, keeping whichever covers more), then runs every strategy through a walk-forward
+test: parameters are picked on 12 months, judged on the next 3 months they never saw,
+rolled forward 3 months at a time. Costs (spread, slippage, commission, overnight funding)
+are charged on every trade. Gate 2 judges only those unseen months: profit factor >= 1.2,
+max drawdown < 10%, >= 200 trades. The report goes to `data/reports/gate2-<time>/`
+(`report.md`, `result.json`, `oos_trades.csv`).
+
+Strategies stay OFF until you switch on the ones that passed:
+
+```bash
+uv run tradeengine gate2-apply data/reports/gate2-<time>/result.json --dry-run
+uv run tradeengine gate2-apply data/reports/gate2-<time>/result.json
+```
+
+From then on `tradeengine run` trades them on the demo accounts once an hour, with the
+same code the backtest used (signal at the hour close, entry at the next open, broker-side
+stop, breakeven at 1R, ATR trail, time exit). Thresholds, costs and walk-forward lengths
+are admin settings (`gate2_*`, `cost_model`, `walk_forward_*`).
+
 ## Everyday commands
 
 ```bash
@@ -94,8 +126,8 @@ uv run tradeengine kill "reason"            # blocks new orders
 uv run tradeengine unkill
 uv run tradeengine settings
 uv run tradeengine settings --set risk_per_trade_pct=0.4 away_mode=false
-uv run tradeengine download --source dukascopy --symbol EUR/USD --days 365
-./scripts/with-secrets.sh uv run tradeengine download --source binance --symbol BTC/USDT --tf M1 --days 30
+./scripts/with-secrets.sh uv run tradeengine download-all --days 1100
+uv run tradeengine gate2
 ```
 
 The kill switch also engages if the file `data/KILL` exists.

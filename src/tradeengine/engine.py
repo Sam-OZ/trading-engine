@@ -39,6 +39,7 @@ from .models import (
 )
 from .reconciler import Reconciler
 from .risk import OpenPositionInfo, RiskContext, RiskDecision, evaluate
+from .runner import StrategyRunner
 from .settings_store import RuntimeSettings, SettingsStore
 from .sizing import conversion_rate
 from .state import EngineState, log_event
@@ -152,7 +153,7 @@ class Engine:
     async def _virtual_binance_account(self, real: AccountSnapshot) -> AccountSnapshot:
         """Binance Demo Mode hands out its own default balances, which we cannot set to $10,000.
 
-        So the engine trades a virtual $10,000 (admin setting) on that account:
+        So the engine trades a virtual balance (admin setting binance_virtual_capital) on that account:
         equity = starting capital + realised P&L of engine trades + open unrealised P&L.
         Spending is also capped by the real free USDT.
         """
@@ -169,7 +170,7 @@ class Engine:
             q = self.ticks.last.get(p.symbol)
             if q is not None:
                 unrealised += (q.bid - p.entry_price) * p.size
-        balance = settings.starting_capital_per_venue + realised
+        balance = settings.binance_virtual_capital + realised
         equity = balance + unrealised
         available = max(Decimal(0), min(real.available, balance - committed))
         return AccountSnapshot(Venue.BINANCE, real.currency, balance, equity, available)
@@ -181,6 +182,7 @@ class Engine:
         self._tasks.append(asyncio.create_task(self._loop(self.reconciler.run_once, settings.reconcile_interval_seconds), name="reconcile"))
         self._tasks.append(asyncio.create_task(self._loop(self.refresh_accounts, 60), name="equity"))
         self._tasks.append(asyncio.create_task(self._loop(self._heartbeat, 15), name="heartbeat"))
+        self._tasks.append(asyncio.create_task(StrategyRunner(self).run_forever(), name="strategies"))
         await log_event(self.db, "INFO", "engine", "Engine started", {"venues": [v.value for v in self.adapters]})
         await asyncio.gather(*self._tasks)
 

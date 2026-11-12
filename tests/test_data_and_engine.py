@@ -186,7 +186,7 @@ async def test_emergency_flatten_closes_everything(engine):
     assert closed == ["EUR/USD"] and (await engine.state.is_halted())[0]
 
 
-async def test_binance_trades_a_virtual_10k_not_the_demo_default_balance(tmp_path):
+async def test_binance_trades_the_virtual_balance_not_the_demo_default_balance(tmp_path):
     from tradeengine.models import AccountSnapshot
 
     class RichDemo(FakeAdapter):
@@ -198,7 +198,7 @@ async def test_binance_trades_a_virtual_10k_not_the_demo_default_balance(tmp_pat
     await e.start()
     try:
         acct = e.accounts[Venue.BINANCE]
-        assert acct.equity == D("10000") and acct.available == D("10000")
+        assert acct.equity == D("5000") and acct.available == D("5000")
         async with e.db.sessions() as s, s.begin():
             s.add(PositionRow(venue="binance", symbol="BTC/USDT", side="BUY", size=D("0.01"), entry_price=D("60000"), broker_position_id="1",
                               source="strategy", strategy="x", status="closed", realised_pnl=D("-25")))
@@ -206,6 +206,6 @@ async def test_binance_trades_a_virtual_10k_not_the_demo_default_balance(tmp_pat
                               source="strategy", strategy="x", status="open"))
         await e.refresh_accounts()
         acct = e.accounts[Venue.BINANCE]
-        assert acct.balance == D("9975") and acct.available == D("6975")
+        assert acct.balance == D("4975") and acct.available == D("1975")
     finally:
         await e.stop()

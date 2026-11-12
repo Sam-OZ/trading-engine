@@ -89,6 +89,20 @@ class PositionRow(Base):
     exit_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 
+class PositionMetaRow(Base):
+    """How a strategy position is managed after entry (trail, breakeven, time exit)."""
+
+    __tablename__ = "position_meta"
+
+    client_order_id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    strategy: Mapped[str] = mapped_column(String(64))
+    initial_risk: Mapped[Decimal] = mapped_column(PRICE)  # price distance entry -> first stop
+    trail_atr: Mapped[Decimal | None] = mapped_column(PRICE, nullable=True)
+    breakeven_at_r: Mapped[Decimal | None] = mapped_column(PRICE, nullable=True)
+    max_bars: Mapped[int] = mapped_column(Integer)
+    signal_bar: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 class EventRow(Base):
     """Audit log: every decision, rejection, reconcile action and alert."""
 
