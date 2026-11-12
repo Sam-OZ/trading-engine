@@ -24,6 +24,7 @@ from tradeengine.notify import (
     BOOKMARK,
     FORWARD_START,
     LAST_SUMMARY,
+    TelegramError,
     TelegramNotifier,
     find_chat_id,
     format_event,
@@ -124,7 +125,7 @@ async def test_notifier_starts_from_now_sends_new_events_dedupes_and_retries_aft
         # Telegram down: nothing lost, the bookmark stays and the event goes out on the next pass
         route.mock(return_value=httpx.Response(502))
         await log_event(eng.db, "ERROR", "runner", "Hourly run failed: boom")
-        with pytest.raises(httpx.HTTPStatusError):
+        with pytest.raises(TelegramError):
             await n.run_once(client, morning)
         route.mock(return_value=httpx.Response(200, json={"ok": True}))
         assert await n.run_once(client, morning) == 1
@@ -238,3 +239,53 @@ def test_server_never_reads_secret_manager_and_unit_runs_as_trader():
     vm = (ROOT / "scripts/vm.sh").read_text()
     assert 'SERVER_SECRETS="BINANCE_API_KEY BINANCE_API_SECRET TELEGRAM_BOT_TOKEN"' in vm  # no Capital.com or Anthropic keys
     assert "--tunnel-through-iap" in vm and "e2-micro" in vm and "pd-standard" in vm
+
+
+# ------------------------------------------------------------------ secrets stay out of logs
+TOKEN = "9174070385:AAFabcdefghijklmnopqrstuvwxyz012345"
+
+
+def test_bot_token_is_redacted_from_log_lines_and_tracebacks(caplog):
+    import logging
+
+    from tradeengine.logsafe import RedactFilter, redact
+
+    assert redact(f'GET https://api.telegram.org/bot{TOKEN}/getUpdates "HTTP/1.1 200 OK"') == \
+        'GET https://api.telegram.org/bot<redacted>/getUpdates "HTTP/1.1 200 OK"'
+    handler = logging.StreamHandler()
+    handler.addFilter(RedactFilter())
+    rec = logging.LogRecord("httpx", logging.INFO, __file__, 1, "HTTP Request: %s %s", ("POST", f"https://api.telegram.org/bot{TOKEN}/sendMessage"), None)
+    handler.filter(rec)
+    assert TOKEN not in rec.getMessage() and "bot<redacted>" in rec.getMessage()
+    try:
+        raise RuntimeError(f"boom at https://api.telegram.org/bot{TOKEN}/x")
+    except RuntimeError:
+        import sys
+
+        rec = logging.LogRecord("x", logging.WARNING, __file__, 1, "failed", None, sys.exc_info())
+    handler.filter(rec)
+    assert rec.exc_info is None and TOKEN not in rec.exc_text and "bot<redacted>" in rec.exc_text
+
+
+@respx.mock
+async def test_telegram_errors_never_carry_the_token():
+    from tradeengine.notify import send
+
+    respx.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage").mock(return_value=httpx.Response(401))
+    async with httpx.AsyncClient() as client:
+        with pytest.raises(TelegramError) as e:
+            await send(client, TOKEN, "1", "hi")
+    assert str(e.value) == "Telegram sendMessage failed: HTTP 401" and TOKEN not in str(e.value)
+
+
+def test_the_cli_installs_the_redaction_on_start(tmp_path, monkeypatch, capsys):
+    import logging
+
+    from tradeengine.cli import main as cli_main
+    from tradeengine.logsafe import RedactFilter
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{tmp_path / 'e.db'}")
+    cli_main(["settings"])
+    capsys.readouterr()
+    assert any(isinstance(f, RedactFilter) for h in logging.getLogger().handlers for f in h.filters)

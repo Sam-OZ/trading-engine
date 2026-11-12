@@ -488,6 +488,9 @@ async def cmd_telegram_setup(_args) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    from .logsafe import install as _redact_logs
+
+    _redact_logs()  # bot tokens never reach the terminal or the server's journal
     p = argparse.ArgumentParser(prog="tradeengine", description="Demo-only trading engine")
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("status")

@@ -25,6 +25,15 @@ from .models import PositionStatus
 
 log = logging.getLogger(__name__)
 
+
+class TelegramError(RuntimeError):
+    """A Telegram API call failed. The message never contains the bot token (Telegram puts it in the URL)."""
+
+
+def _check(r: httpx.Response, what: str) -> None:
+    if r.status_code != 200:
+        raise TelegramError(f"Telegram {what} failed: HTTP {r.status_code}")
+
 API = "https://api.telegram.org"
 BOOKMARK = "telegram_last_event_id"
 LAST_SUMMARY = "telegram_last_summary"
@@ -52,13 +61,13 @@ async def send(client: httpx.AsyncClient, token: str, chat_id: str, text: str) -
     for i in range(0, len(text), 3900):  # Telegram's limit is 4,096 characters per message
         r = await client.post(f"{API}/bot{token}/sendMessage", json={"chat_id": chat_id, "text": text[i:i + 3900],
                                                                     "disable_web_page_preview": True})
-        r.raise_for_status()
+        _check(r, "sendMessage")
 
 
 async def find_chat_id(client: httpx.AsyncClient, token: str) -> tuple[str, str] | None:
     """The chat that most recently messaged the bot: (chat id, name). Send the bot any message first."""
     r = await client.get(f"{API}/bot{token}/getUpdates")
-    r.raise_for_status()
+    _check(r, "getUpdates")
     for upd in reversed(r.json().get("result", [])):
         chat = (upd.get("message") or upd.get("edited_message") or {}).get("chat")
         if chat:
