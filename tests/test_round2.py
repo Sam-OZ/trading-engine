@@ -464,3 +464,15 @@ def test_dev_run_refuses_an_incomplete_basket(small_round, monkeypatch, tmp_path
         cli_main(["round2", "--dev"])
     assert "Not run: history missing or short for: USD/JPY" in str(e.value)
     assert not (tmp_path / "data" / "reports").exists()  # nothing produced, nothing counted
+
+
+def test_a_hole_in_the_history_blocks_the_run(small_round):
+    from tradeengine.history import read_frame
+
+    path = small_round / "history" / "dukascopy" / "EURUSD_H1.csv.gz"
+    df = read_frame(path)
+    holed = df[(df.index < pd.Timestamp("2018-03-01", tz="UTC")) | (df.index >= pd.Timestamp("2018-04-01", tz="UTC"))]
+    path.unlink()
+    write_bars(path, frame_to_bars(holed, "EUR/USD", "H1"))
+    with pytest.raises(r2.IncompleteData, match="hole in the data before 2018-04"):
+        r2.run_dev(small_round, _settings(), DEFAULT_INSTRUMENTS, progress=lambda *_: None)

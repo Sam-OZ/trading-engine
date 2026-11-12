@@ -77,6 +77,7 @@ class Rules:
 
 RULES = Rules()
 START_EQUITY = 10_000.0  # per venue; percentages are what matter
+MAX_DATA_GAP = pd.Timedelta(days=4)  # longer than any weekend + holiday: a hole a download left
 
 
 # ------------------------------------------------------------------ data
@@ -110,8 +111,14 @@ def load_round2_data(data_dir: Path, instruments: dict, until: pd.Timestamp) -> 
             notes.append(f"{sym}: no history between {start:%Y-%m-%d} and {until:%Y-%m-%d}")
             continue
         late = (df.index[0] - start).days > 31
+        gaps = df.index.to_series().diff()
+        worst = gaps.max() if len(gaps) > 1 else pd.Timedelta(0)
+        holes = ""
+        if worst > MAX_DATA_GAP:
+            at = gaps.idxmax()
+            holes = f" (WARNING: {worst.days}-day hole in the data before {at:%Y-%m-%d})"
         notes.append(f"{sym}: {len(df):,} hourly bars, {df.index[0]:%Y-%m-%d} to {df.index[-1]:%Y-%m-%d}"
-                     + (f" (WARNING: starts {(df.index[0] - start).days} days after {start:%Y-%m-%d})" if late else ""))
+                     + (f" (WARNING: starts {(df.index[0] - start).days} days after {start:%Y-%m-%d})" if late else "") + holes)
         data[sym] = (df, inst)
     return data, notes
 

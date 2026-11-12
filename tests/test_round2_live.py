@@ -263,56 +263,126 @@ def _candles(base: datetime, hours: list[int], price: int) -> bytes:
     return lzma.compress(recs, format=lzma.FORMAT_ALONE)
 
 
+def fast():
+    from tradeengine.history import Throttle
+
+    return Throttle(8, 0.0)
+
+
+MINUTE = lzma.compress(struct.pack(">IIIIIf", 0, 110100, 110110, 110090, 110120, 1.0), format=lzma.FORMAT_ALONE)
+
+
+@pytest.fixture
+def no_sleep(monkeypatch):
+    import asyncio as aio
+
+    real = aio.sleep
+    waits: list[float] = []
+
+    async def fake(seconds, *a, **k):
+        waits.append(seconds)
+        await real(0)
+
+    monkeypatch.setattr(aio, "sleep", fake)  # backoff waits are recorded, not waited
+    return waits
+
+
 @respx.mock
 async def test_monthly_hourly_files_with_fallback_to_minutes_and_minutes_for_the_current_month():
     respx.get(url__regex=r".*/EURUSD/2024/00/BID_candles_hour_1\.bi5").mock(
         return_value=httpx.Response(200, content=_candles(datetime(2024, 1, 1), [0, 1, 24 * 30], 110000)))
     respx.get(url__regex=r".*/EURUSD/2024/01/BID_candles_hour_1\.bi5").mock(return_value=httpx.Response(404))
-    minute = lzma.compress(struct.pack(">IIIIIf", 0, 110100, 110110, 110090, 110120, 1.0), format=lzma.FORMAT_ALONE)
-    respx.get(url__regex=r".*/EURUSD/2024/0[12]/\d\d/BID_candles_min_1\.bi5").mock(return_value=httpx.Response(200, content=minute))
+    respx.get(url__regex=r".*/EURUSD/2024/0[12]/\d\d/BID_candles_min_1\.bi5").mock(return_value=httpx.Response(200, content=MINUTE))
     async with httpx.AsyncClient() as client:
-        bars, stats = await download_dukascopy_h1(client, "EUR/USD", date(2024, 1, 1), date(2024, 3, 3), today=date(2024, 3, 2))
+        bars, stats = await download_dukascopy_h1(client, "EUR/USD", date(2024, 1, 1), date(2024, 3, 3), today=date(2024, 3, 2),
+                                                  throttle=fast())
     jan = [b for b in bars if b.open_time.month == 1]
     assert [b.open_time.hour for b in jan[:2]] == [0, 1] and jan[2].open_time.day == 31
     assert all(b.timeframe == "H1" for b in bars) and float(jan[0].close) == pytest.approx(1.1001)
     feb = [b for b in bars if b.open_time.month == 2]
-    assert len(feb) == 29  # leap year: one bar per day built from minute files
+    assert len(feb) == 29  # leap year: one bar per day built from minute files (monthly file 404)
     mar = [b for b in bars if b.open_time.month == 3]
     assert [b.open_time.day for b in mar] == [1, 2]  # the current month from minutes, nothing after "today"
-    assert stats == {"monthly": 1, "from_minutes": 2, "monthly_problem": "monthly file not found (404)"}
+    assert stats == {"monthly": 1, "from_minutes": 2, "skipped": 0, "failed": []}
 
 
 @respx.mock
-async def test_a_refused_monthly_file_falls_back_to_minutes_and_names_the_cause(monkeypatch):
-    import asyncio as aio
-
-    async def no_sleep(_):
-        return None
-
-    monkeypatch.setattr(aio, "sleep", no_sleep)  # the backoff waits are not what is tested
-    respx.get(url__regex=r".*/BID_candles_hour_1\.bi5").mock(return_value=httpx.Response(503))
-    minute = lzma.compress(struct.pack(">IIIIIf", 0, 110100, 110110, 110090, 110120, 1.0), format=lzma.FORMAT_ALONE)
-    respx.get(url__regex=r".*/BID_candles_min_1\.bi5").mock(return_value=httpx.Response(200, content=minute))
+async def test_429_waits_and_retries_instead_of_multiplying_requests(no_sleep):
+    route = respx.get(url__regex=r".*/EURUSD/2024/00/BID_candles_hour_1\.bi5")
+    route.side_effect = [httpx.Response(429, headers={"Retry-After": "7"}), httpx.Response(429),
+                         httpx.Response(200, content=_candles(datetime(2024, 1, 1), [0], 110000))]
+    minutes = respx.get(url__regex=r".*/BID_candles_min_1\.bi5").mock(return_value=httpx.Response(200, content=MINUTE))
     async with httpx.AsyncClient() as client:
-        bars, stats = await download_dukascopy_h1(client, "EUR/USD", date(2024, 1, 1), date(2024, 3, 1), today=date(2024, 6, 1))
-    assert len(bars) == 31 + 29 and stats["monthly"] == 0 and stats["from_minutes"] == 2
-    assert "HTTP 503" in stats["monthly_problem"]
+        bars, stats = await download_dukascopy_h1(client, "EUR/USD", date(2024, 1, 1), date(2024, 2, 1), today=date(2024, 6, 1),
+                                                  throttle=fast())
+    assert len(bars) == 1 and stats["monthly"] == 1 and stats["failed"] == []
+    assert minutes.call_count == 0  # a busy server is waited out, not hit with 30x more requests
+    # the server's own Retry-After first (7 s), then our backoff (2nd 429: 30 s), all requests held back
+    assert any(abs(w - 7) < 0.1 for w in no_sleep) and any(abs(w - 30) < 0.1 for w in no_sleep)
 
 
 @respx.mock
-async def test_a_minute_file_that_keeps_failing_names_the_http_status(monkeypatch):
+async def test_a_month_that_keeps_failing_is_reported_and_the_rest_is_kept(no_sleep):
+    respx.get(url__regex=r".*/EURUSD/2024/00/BID_candles_hour_1\.bi5").mock(return_value=httpx.Response(429))
+    respx.get(url__regex=r".*/EURUSD/2024/01/BID_candles_hour_1\.bi5").mock(
+        return_value=httpx.Response(200, content=_candles(datetime(2024, 2, 1), [0, 5], 110000)))
+    async with httpx.AsyncClient() as client:
+        bars, stats = await download_dukascopy_h1(client, "EUR/USD", date(2024, 1, 1), date(2024, 3, 1), today=date(2024, 6, 1),
+                                                  throttle=fast())
+    assert [b.open_time.month for b in bars] == [2, 2]
+    assert stats["failed"] == ["2024-01: HTTP 429 after 8 attempts"]
+
+
+@respx.mock
+async def test_resume_skips_months_on_disk_but_refetches_the_latest_as_a_check():
+    hourly = respx.get(url__regex=r".*/EURUSD/\d{4}/\d\d/BID_candles_hour_1\.bi5").mock(
+        return_value=httpx.Response(200, content=_candles(datetime(2024, 1, 1), [0], 110000)))
+    have = {(2024, 1), (2024, 2), (2024, 3)}
+    async with httpx.AsyncClient() as client:
+        _, stats = await download_dukascopy_h1(client, "EUR/USD", date(2024, 1, 1), date(2024, 6, 1), today=date(2024, 9, 1),
+                                               have=have, throttle=fast())
+    fetched = sorted(c.request.url.path.split("/")[-3:-1][1] for c in hourly.calls)
+    assert fetched == ["02", "03", "04"]  # March (index 02) re-checked, April and May (03, 04) new
+    assert stats["skipped"] == 2 and stats["monthly"] == 3
+
+
+def test_complete_months_ignores_partly_covered_months():
+    from tradeengine.history import complete_months
+
+    full = trending_h1("2023-10-01", "2023-12-01")
+    partial = full[full.index >= pd.Timestamp("2023-11-08", tz="UTC")]  # round 1's file started on 8 Nov 2023
+    assert complete_months(full) == {(2023, 10), (2023, 11)}
+    assert complete_months(partial) == set()  # 8 Nov start: November is NOT complete, so it is fetched again
+    assert complete_months(None) == set()
+
+
+async def test_throttle_spaces_out_requests():
+    import time
+
+    from tradeengine.history import Throttle
+
+    t = Throttle(concurrency=4, interval=0.05)
+    starts = []
+
+    async def one():
+        async with t:
+            starts.append(time.monotonic())
+
     import asyncio as aio
 
-    async def no_sleep(_):
-        return None
+    await aio.gather(*(one() for _ in range(5)))
+    gaps = [b - a for a, b in zip(starts, starts[1:], strict=False)]
+    assert min(gaps) >= 0.045
 
-    monkeypatch.setattr(aio, "sleep", no_sleep)
-    respx.get(url__regex=r".*/BID_candles_min_1\.bi5").mock(return_value=httpx.Response(429))
+
+@respx.mock
+async def test_a_minute_file_that_keeps_failing_names_the_http_status(no_sleep):
+    respx.get(url__regex=r".*/BID_candles_min_1\.bi5").mock(return_value=httpx.Response(503))
     from tradeengine.history import download_dukascopy
 
     async with httpx.AsyncClient() as client:
-        with pytest.raises(RuntimeError, match="HTTP 429 after 4 attempts"):
-            await download_dukascopy(client, "EUR/USD", date(2024, 1, 2), date(2024, 1, 3))
+        with pytest.raises(RuntimeError, match="HTTP 503 after 4 attempts"):
+            await download_dukascopy(client, "EUR/USD", date(2024, 1, 2), date(2024, 1, 3), throttle=fast())
 
 
 def test_gold_scale_and_price_range_check():
@@ -406,3 +476,24 @@ def test_download_all_exits_non_zero_when_forex_history_fails(tmp_path, monkeypa
     with pytest.raises(SystemExit) as e:
         cli.main(["download-all", "--from", "2026-10-01"])
     assert "Download incomplete (11)" in str(e.value) and "dukascopy XAU/USD" in str(e.value)
+
+
+def test_cli_saves_what_arrived_and_reports_missing_months(tmp_path, monkeypatch, capsys):
+    from tradeengine import cli
+
+    h1 = trending_h1("2024-01-01", "2024-03-01")
+
+    async def partial(client, symbol, start, end, **kw):
+        assert kw["have"] == set()
+        part = h1[h1.index < pd.Timestamp("2024-02-01", tz="UTC")]
+        return frame_to_bars(part, symbol, "H1"), {"monthly": 1, "from_minutes": 0, "skipped": 0, "failed": ["2024-02: HTTP 429 after 8 attempts"]}
+
+    monkeypatch.setattr(cli, "download_dukascopy_h1", partial)
+    cfg = InfraConfig(_env_file=None, data_dir=tmp_path)
+    import asyncio
+
+    ok = asyncio.run(cli._download_dukascopy(cfg, "EUR/USD", datetime(2024, 1, 1, tzinfo=UTC), datetime(2024, 3, 1, tzinfo=UTC)))
+    out = capsys.readouterr().out
+    assert ok is False and "1 month(s) still missing (2024-02: HTTP 429" in out and "run the same command again" in out
+    saved = read_frame(history_path(tmp_path, "dukascopy", "EUR/USD", "H1"))
+    assert saved.index[-1] < pd.Timestamp("2024-02-01", tz="UTC") and len(saved) > 400

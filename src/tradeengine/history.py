@@ -89,39 +89,89 @@ def decode_candles(raw: bytes, base: datetime, symbol: str, timeframe: str) -> l
     return bars
 
 
-async def _fetch(client: httpx.AsyncClient, url: str, sem, retries: int) -> httpx.Response:
-    """GET with backoff (1, 2, 4, 8 s ...). Returns a 200 or 404 response; otherwise raises with
-    what the server last said, so a failure names its cause (HTTP status or network error)."""
+class Throttle:
+    """Polite pacing for one data host: at most `concurrency` requests in flight and at least
+    `interval` seconds between request starts. Dukascopy answers HTTP 429 when asked too fast."""
+
+    def __init__(self, concurrency: int = 2, interval: float = 0.4):
+        import asyncio
+
+        self.sem = asyncio.Semaphore(concurrency)
+        self.interval = interval
+        self._lock = asyncio.Lock()
+        self._next = 0.0
+
+    async def __aenter__(self):
+        import asyncio
+        import time
+
+        await self.sem.acquire()
+        async with self._lock:
+            now = time.monotonic()
+            wait = self._next - now
+            self._next = max(now, self._next) + self.interval
+        if wait > 0:
+            await asyncio.sleep(wait)
+        return self
+
+    async def __aexit__(self, *exc):
+        self.sem.release()
+
+    async def pause(self, seconds: float) -> None:
+        """After a 429: hold back every request, not just the one that was refused."""
+        import time
+
+        async with self._lock:
+            self._next = max(self._next, time.monotonic() + seconds)
+
+
+async def _fetch(client: httpx.AsyncClient, url: str, throttle, retries: int = 4, busy_retries: int = 8) -> httpx.Response:
+    """GET through the throttle. Returns a 200 or 404 response; otherwise raises with what the
+    server last said. HTTP 429 ("too many requests") waits Retry-After or 15, 30, 60, 120 s
+    (capped at 120) and gets more attempts than other errors (1, 2, 4, 8 s)."""
     import asyncio
 
-    last = "no response"
-    for attempt in range(retries):
-        async with sem:
+    last, busy, other = "no response", 0, 0
+    while True:
+        async with throttle:
             try:
                 r = await client.get(url)
             except httpx.TransportError as e:
-                r, last = None, f"{type(e).__name__}"
+                r, last = None, type(e).__name__
+        if r is not None and r.status_code in (200, 404):
+            return r
+        if r is not None and r.status_code == 429:
+            busy += 1
+            last = "HTTP 429"
+            if busy >= busy_retries:
+                break
+            try:
+                wait = float(r.headers.get("Retry-After", ""))
+            except ValueError:
+                wait = min(120.0, 15.0 * 2 ** (busy - 1))
+            await throttle.pause(wait)
+            continue
         if r is not None:
-            if r.status_code in (200, 404):
-                return r
             last = f"HTTP {r.status_code}"
-        if attempt < retries - 1:
-            await asyncio.sleep(2**attempt)
-    raise RuntimeError(f"Dukascopy {url}: {last} after {retries} attempts")
+        other += 1
+        if other >= retries:
+            break
+        await asyncio.sleep(2 ** (other - 1))
+    raise RuntimeError(f"Dukascopy {url}: {last} after {busy + other} attempts")
 
 
 async def download_dukascopy(
-    client: httpx.AsyncClient, symbol: str, start: date, end: date, concurrency: int = 8, retries: int = 4, sem=None,
+    client: httpx.AsyncClient, symbol: str, start: date, end: date, concurrency: int = 2, retries: int = 4, throttle=None,
 ) -> list[Bar]:
-    """symbol like "EUR/USD". BID minute candles for each day in [start, end), fetched in parallel."""
+    """symbol like "EUR/USD". BID minute candles for each day in [start, end)."""
     import asyncio
 
     code = symbol.replace("/", "").upper()
     days = [start + timedelta(days=k) for k in range((end - start).days)]
-    sem = sem or asyncio.Semaphore(concurrency)
+    throttle = throttle or Throttle(concurrency)
 
     async def one(d: date) -> list[Bar]:
-        r = await _fetch(client, f"{DUKASCOPY_URL}/{code}/{d.year}/{d.month - 1:02d}/{d.day:02d}/BID_candles_min_1.bi5", sem, retries)
+        r = await _fetch(client, f"{DUKASCOPY_URL}/{code}/{d.year}/{d.month - 1:02d}/{d.day:02d}/BID_candles_min_1.bi5", throttle, retries)
         return decode_dukascopy_candles(r.content, d, symbol) if r.status_code == 200 else []
 
     out: list[Bar] = []
@@ -138,59 +188,84 @@ def _month_starts(start: date, end: date) -> list[date]:
     return out
 
 
+def complete_months(df: pd.DataFrame | None) -> set[tuple[int, int]]:
+    """(year, month) pairs the file already covers end to end: bars within the first and last 4 days
+    of the month and at least 300 hourly bars. A month the file only partly covers is not counted."""
+    if df is None or df.empty:
+        return set()
+    out = set()
+    idx = df.index
+    for (y, m), g in pd.Series(1, index=idx).groupby([idx.year, idx.month]):
+        days_in_month = pd.Period(f"{y}-{m:02d}").days_in_month
+        first, last = g.index[0].day, g.index[-1].day
+        if first <= 4 and last >= days_in_month - 3 and len(g) >= 300:
+            out.add((int(y), int(m)))
+    return out
+
+
 async def download_dukascopy_h1(
-    client: httpx.AsyncClient, symbol: str, start: date, end: date, concurrency: int = 8, retries: int = 4, today: date | None = None,
+    client: httpx.AsyncClient, symbol: str, start: date, end: date, today: date | None = None,
+    have: set[tuple[int, int]] | None = None, throttle=None, progress=None,
 ) -> tuple[list[Bar], dict]:
-    """Hourly BID candles for [start, end). Per month, Dukascopy's monthly file of hourly candles is
-    tried first; if it is missing, refused or fails the checks, the month is built from its daily
-    minute files instead (slower, but the route proven in round 1). The current month always comes
-    from minute files (its monthly file is partial).
-    Returns (bars, {"monthly": n, "from_minutes": n, "monthly_problem": first reason or ""}).
+    """Hourly BID candles for [start, end), one request per month: Dukascopy's monthly file of hourly
+    candles. A month whose monthly file does not exist (404) or fails the checks is built from its
+    daily minute files; the current month always is (its monthly file is partial).
+
+    Resumable: months in `have` (already complete on disk) are skipped, except the latest one, which
+    is fetched again so the new data can be checked against the file. A month that still fails after
+    the retries (e.g. the server keeps answering 429) is reported in stats["failed"], and the months
+    that did arrive are returned, so a re-run continues where this one stopped.
+    Returns (bars, {"monthly", "from_minutes", "skipped", "failed": ["YYYY-MM: reason", ...]}).
     """
     import asyncio
 
     code = symbol.replace("/", "").upper()
     today = today or datetime.now(UTC).date()
-    sem = asyncio.Semaphore(concurrency)  # ALL requests for this symbol share it
-    stats: dict = {"monthly": 0, "from_minutes": 0, "monthly_problem": ""}
-    msem = asyncio.Semaphore(2)  # months in flight
+    throttle = throttle or Throttle()
+    have = set(have or ())
+    verify = max(have) if have else None
+    stats: dict = {"monthly": 0, "from_minutes": 0, "skipped": 0, "failed": []}
 
     async def month(m0: date) -> list[Bar]:
-        async with msem:
-            return await _month(m0)
-
-    async def _month(m0: date) -> list[Bar]:
         m1 = date(m0.year + (m0.month == 12), m0.month % 12 + 1, 1)
-        if not (m0 <= today < m1):
-            problem = ""
-            try:
-                r = await _fetch(client, f"{DUKASCOPY_URL}/{code}/{m0.year}/{m0.month - 1:02d}/BID_candles_hour_1.bi5", sem, 2)
-            except RuntimeError as e:
-                r, problem = None, str(e).split(": ", 1)[-1]
-            if r is not None and r.status_code == 404:
-                problem = "monthly file not found (404)"
-            if r is not None and r.status_code == 200:
+        current = m0 <= today < m1
+        if not current:
+            r = await _fetch(client, f"{DUKASCOPY_URL}/{code}/{m0.year}/{m0.month - 1:02d}/BID_candles_hour_1.bi5", throttle)
+            if r.status_code == 200:
                 try:
                     bars = decode_candles(r.content, datetime(m0.year, m0.month, 1, tzinfo=UTC), symbol, "H1")
                     end_of_month = datetime(m1.year, m1.month, 1, tzinfo=UTC)
                     if all(b.open_time.minute == 0 and b.open_time.second == 0 and b.open_time < end_of_month for b in bars):
                         stats["monthly"] += 1
                         return bars
-                    problem = "monthly file failed the checks"
-                except (ValueError, lzma.LZMAError) as e:
-                    problem = f"monthly file unreadable ({e})"
-            if problem and not stats["monthly_problem"]:
-                stats["monthly_problem"] = problem
+                except (ValueError, lzma.LZMAError):
+                    pass
         stats["from_minutes"] += 1
         first, last = max(m0, start), min(m1, end, today + timedelta(days=1))
-        minutes = await download_dukascopy(client, symbol, first, last, retries=retries, sem=sem) if last > first else []
-        if not minutes:
-            return []
-        return frame_to_bars(resample_frame(bars_to_frame(minutes), "1h"), symbol, "H1")
+        minutes = await download_dukascopy(client, symbol, first, last, throttle=throttle) if last > first else []
+        return frame_to_bars(resample_frame(bars_to_frame(minutes), "1h"), symbol, "H1") if minutes else []
 
+    async def guarded(m0: date) -> list[Bar]:
+        try:
+            bars = await month(m0)
+        except RuntimeError as e:
+            stats["failed"].append(f"{m0:%Y-%m}: {str(e).split(': ', 1)[-1]}")
+            return []
+        if progress is not None and m0.month == 12:
+            progress(f"{m0:%Y} done")
+        return bars
+
+    todo = []
+    for m0 in _month_starts(start, end):
+        key = (m0.year, m0.month)
+        if key in have and key != verify and not (m0 <= today < date(m0.year + (m0.month == 12), m0.month % 12 + 1, 1)):
+            stats["skipped"] += 1
+            continue
+        todo.append(m0)
     out: list[Bar] = []
-    for bars in await asyncio.gather(*(month(m) for m in _month_starts(start, end))):
+    for bars in await asyncio.gather(*(guarded(m) for m in todo)):
         out.extend(b for b in bars if start <= b.open_time.date() < end)
+    stats["failed"].sort()
     check_price_range(symbol, out)
     return out, stats
 

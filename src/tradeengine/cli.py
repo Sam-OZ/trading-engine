@@ -204,17 +204,25 @@ def cross_check(existing, new, spread: float) -> tuple[int, float, float]:
 
 
 async def _download_dukascopy(cfg, symbol: str, start, end) -> bool:
-    """Hourly Dukascopy history; checked against the hours already on disk before it is merged in."""
+    """Hourly Dukascopy history, resumable: months already complete on disk are skipped (except the
+    latest, re-fetched as a check). New hours are compared with the hours already on disk before they
+    are merged in. Months that arrived are saved even if others failed; returns False if any failed."""
     from .backtest import cost_for
+    from .history import complete_months
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        bars, stats = await download_dukascopy_h1(client, symbol, start.date(), end.date() + timedelta(days=1))
     path = history_path(cfg.data_dir, "dukascopy", symbol, "H1")
+    existing = read_frame(path)
+    have = complete_months(existing)
+    print(f"  dukascopy {symbol:<9} downloading ({len(have)} month(s) already on disk) ...", flush=True)
+    async with httpx.AsyncClient(timeout=30) as client:
+        bars, stats = await download_dukascopy_h1(
+            client, symbol, start.date(), end.date() + timedelta(days=1), have=have,
+            progress=lambda msg: print(f"  dukascopy {symbol:<9} {msg}", flush=True),
+        )
     first = bars[0].open_time.date() if bars else None
-    where = f"{stats['monthly']} monthly files, {stats['from_minutes']} month(s) from minute files"
-    if stats.get("monthly_problem"):
-        where += f"; monthly files: {stats['monthly_problem']}"
-    n_overlap, max_diff, share = cross_check(read_frame(path), bars_to_frame(bars) if bars else None, cost_for(symbol).spread or 0.0)
+    where = (f"{stats['monthly']} monthly files, {stats['from_minutes']} month(s) from minute files, "
+             f"{stats.get('skipped', 0)} already on disk")
+    n_overlap, max_diff, share = cross_check(existing, bars_to_frame(bars) if bars else None, cost_for(symbol).spread or 0.0)
     check = ""
     if n_overlap:
         check = f"; matches the {n_overlap:,} hours already on disk (max close difference {max_diff:.5g})"
@@ -222,8 +230,13 @@ async def _download_dukascopy(cfg, symbol: str, start, end) -> bool:
             print(f"  dukascopy {symbol:<9} NOT SAVED: {share:.1%} of the {n_overlap:,} overlapping hours differ from the file "
                   f"on disk by more than one spread (max {max_diff:.5g}). Send this line to Claude.")
             return False
-    n = write_bars(path, bars)
-    print(f"  dukascopy {symbol:<9} H1: {len(bars):,} bars from {first} ({where}){check}; file {n:,} rows")
+    n = write_bars(path, bars) if bars else (len(existing) if existing is not None else 0)
+    print(f"  dukascopy {symbol:<9} H1: {len(bars):,} new bars from {first} ({where}){check}; file {n:,} rows")
+    if stats.get("failed"):
+        shown = "; ".join(stats["failed"][:3]) + (f"; ... {len(stats['failed']) - 3} more" if len(stats["failed"]) > 3 else "")
+        print(f"  dukascopy {symbol:<9} {len(stats['failed'])} month(s) still missing ({shown}). "
+              "What arrived is saved: run the same command again to fetch the rest.")
+        return False
     return True
 
 
