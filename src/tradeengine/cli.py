@@ -14,7 +14,8 @@
   round2 --dev            round 2 development run (check 1) + frozen basket
   round2 --holdout <dev result.json>   round 2 holdout (check 2): ONE run per strategy, ever
   round3 --dev / --holdout <json>      round 3 (crypto only), same rules of play
-  gate2-apply <json>      switch on the strategies that passed (Gate 2 or round 2 holdout result)
+  gate2-apply <json> [--only S]   switch on the strategies that passed (Gate 2 or a round holdout result)
+  telegram-setup          link the alerts bot to your Telegram chat (send the bot a message first)
 """
 
 from __future__ import annotations
@@ -430,7 +431,12 @@ async def cmd_gate2_apply(args) -> None:
     """Enable the strategies that passed Gate 2, on their eligible instruments, with the latest window's parameters."""
     data = json.loads(Path(args.result).read_text())
     enabled, params = {}, {}
+    known = {v["strategy"] for v in data["verdicts"]}
+    if args.only and not set(args.only) <= known:
+        sys.exit(f"--only {', '.join(sorted(set(args.only) - known))}: not in this result (it has {', '.join(sorted(known))})")
     for v in data["verdicts"]:
+        if args.only and v["strategy"] not in args.only:
+            continue
         if v["passed"] and v["enabled_symbols"]:
             enabled[v["strategy"]] = v["enabled_symbols"]
             params[v["strategy"]] = {s: parse_params_id(v["latest_params"][s]) for s in v["enabled_symbols"] if s in v["latest_params"]}
@@ -441,6 +447,11 @@ async def cmd_gate2_apply(args) -> None:
             print(json.dumps({"strategies_enabled": enabled, "strategy_params": params}, indent=2))
             return
         settings = await eng.settings_store.update({"strategies_enabled": enabled, "strategy_params": params}, "gate2-apply")
+        if enabled:  # the forward test's clock starts now (the daily Telegram summary counts its trades from here)
+            from .notify import FORWARD_START, _set_state
+
+            await _set_state(eng.db, FORWARD_START, {"at": datetime.now(UTC).isoformat(), "strategies": sorted(enabled),
+                                                     "result": str(args.result)})
         print("Enabled:" if enabled else "Nothing passed: all strategies stay off.")
         for s, syms in enabled.items():
             print(f"  {s}: {', '.join(syms)}")
@@ -450,6 +461,29 @@ async def cmd_gate2_apply(args) -> None:
                   "Add them with `tradeengine settings --set instruments='[...]'`.")
     finally:
         await eng.stop()
+
+
+async def cmd_telegram_setup(_args) -> None:
+    """Find the chat that messaged the bot, save its id, switch alerts on and send a test message."""
+    from .notify import find_chat_id, send
+
+    cfg = load_config()
+    if cfg.telegram_bot_token is None:
+        sys.exit("TELEGRAM_BOT_TOKEN is not set (run through scripts/with-secrets.sh, or on the server).")
+    token = cfg.telegram_bot_token.get_secret_value()
+    async with httpx.AsyncClient(timeout=15) as client:
+        found = await find_chat_id(client, token)
+        if found is None:
+            sys.exit("No message found. Open the bot in Telegram, send it any message (e.g. /start), then run this again.")
+        chat_id, who = found
+        await send(client, token, chat_id, "✅ Trading engine connected. You will get trade alerts, problems and a daily summary here.")
+    eng = _engine(need_brokers=False)
+    try:
+        await eng.db.create_all()
+        await eng.settings_store.update({"telegram_chat_id": chat_id, "telegram_alerts_enabled": True}, "telegram-setup")
+    finally:
+        await eng.stop()
+    print(f"Telegram alerts on: chat {chat_id} ({who}). A test message was sent.")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -491,6 +525,8 @@ def main(argv: list[str] | None = None) -> None:
     ga = sub.add_parser("gate2-apply")
     ga.add_argument("result", help="data/reports/gate2-.../result.json")
     ga.add_argument("--dry-run", action="store_true")
+    ga.add_argument("--only", action="append", metavar="STRATEGY", help="switch on only this strategy (repeatable)")
+    sub.add_parser("telegram-setup")
     args = p.parse_args(argv)
     handler = {
         "status": cmd_status,
@@ -506,6 +542,7 @@ def main(argv: list[str] | None = None) -> None:
         "gate2": cmd_gate2,
         "round2": cmd_round2,
         "round3": cmd_round3,
+        "telegram-setup": cmd_telegram_setup,
         "gate2-apply": cmd_gate2_apply,
     }[args.cmd]
     asyncio.run(handler(args))

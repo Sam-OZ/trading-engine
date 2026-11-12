@@ -1,0 +1,9 @@
+[Unit]
+Description=Nightly trading journal backup (03:15 UTC = 11:15 Perth)
+
+[Timer]
+OnCalendar=*-*-* 03:15:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

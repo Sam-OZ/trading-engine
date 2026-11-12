@@ -200,7 +200,7 @@ async def test_runner_trades_once_per_signal_and_records_management(runner_env):
     assert meta.strategy == "scripted" and meta.max_bars == 5
     assert pd.Timestamp(meta.signal_bar).tz_localize(None) == h1.index[-1].tz_localize(None)
     again = await runner.on_hour(now)  # same hour processed twice (restart)
-    assert fake.open_calls == 1 and "already holding" in again[0]
+    assert fake.open_calls == 1 and again == []  # the strategy already holds it: no new signal at all, as in the backtest
 
 
 async def test_runner_trails_then_time_exits(runner_env):

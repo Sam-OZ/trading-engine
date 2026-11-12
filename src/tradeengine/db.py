@@ -167,7 +167,21 @@ class CandleRow(Base):
 
 class Database:
     def __init__(self, url: str):
-        self.engine: AsyncEngine = create_async_engine(url, future=True)
+        sqlite = url.startswith("sqlite")
+        # SQLite on the server is shared by the running engine and short CLI commands (`te status`):
+        # WAL lets readers and the writer work side by side, and a 30 s busy timeout rides out the rest.
+        # Backups use SQLite's .backup API, which is safe with WAL (never file-copy a live WAL database).
+        self.engine: AsyncEngine = create_async_engine(url, future=True, connect_args={"timeout": 30} if sqlite else {})
+        if sqlite:
+            from sqlalchemy import event
+
+            @event.listens_for(self.engine.sync_engine, "connect")
+            def _sqlite_pragmas(dbapi_conn, _record):
+                cur = dbapi_conn.cursor()
+                cur.execute("PRAGMA journal_mode=WAL")
+                cur.execute("PRAGMA busy_timeout=30000")
+                cur.close()
+
         self.sessions = async_sessionmaker(self.engine, expire_on_commit=False, class_=AsyncSession)
 
     async def create_all(self) -> None:

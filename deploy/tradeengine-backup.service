@@ -1,0 +1,6 @@
+[Unit]
+Description=Nightly copy of the trading journal to Cloud Storage
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/tradeengine-backup __BUCKET__

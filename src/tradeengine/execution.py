@@ -196,9 +196,16 @@ class ExecutionService:
             pos.status = PositionStatus.CLOSED.value
             pos.closed_at = datetime.now(UTC)
             pos.exit_price = exit_price
-            pos.exit_reason = reason
+            pos.exit_reason = reason[:64]
             if exit_price is not None:
                 pos.realised_pnl = (exit_price - pos.entry_price) * pos.size * Side(pos.side).sign
+            symbol, side, cid, pnl = pos.symbol, pos.side, pos.client_order_id, pos.realised_pnl
+        # every close goes through here (engine exit, broker stop seen by the reconciler, emergency): one event each
+        await log_event(
+            self.db, "INFO", "execution",
+            f"Closed {side} {symbol}: {reason}" + (f"; P&L {pnl:+.2f}" if pnl is not None else ""),
+            {"cid": cid, "exit": exit_price, "pnl": pnl},
+        )
 
     async def close(self, pos_id: int, reason: str) -> bool:
         async with self.db.sessions() as s:
@@ -209,8 +216,13 @@ class ExecutionService:
         bp = journal_to_broker(pos)
         ok = await adapter.close_position(bp)
         if ok:
-            await self.mark_closed(pos_id, None, reason)
-            await log_event(self.db, "INFO", "execution", f"Closed {pos.symbol}: {reason}", {"cid": pos.client_order_id})
+            exit_price = None
+            try:  # the broker's own record of the closing fill, so the journal holds a real exit price and P&L
+                info = await adapter.exit_info(bp)
+                exit_price = info.exit_price if info.status == "closed" else None
+            except Exception as e:
+                log.warning("exit price lookup failed for %s: %s", pos.client_order_id, e)
+            await self.mark_closed(pos_id, exit_price, reason)
         return ok
 
     async def known_broker_ids(self) -> set[str]:

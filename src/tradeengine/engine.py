@@ -194,6 +194,11 @@ class Engine:
         self._tasks.append(asyncio.create_task(self._loop(self.refresh_accounts, 60), name="equity"))
         self._tasks.append(asyncio.create_task(self._loop(self._heartbeat, 15), name="heartbeat"))
         self._tasks.append(asyncio.create_task(StrategyRunner(self).run_forever(), name="strategies"))
+        if self.cfg.telegram_bot_token is not None:
+            from .notify import TelegramNotifier
+
+            token = self.cfg.telegram_bot_token.get_secret_value()
+            self._tasks.append(asyncio.create_task(TelegramNotifier(self, token).run_forever(), name="telegram"))
         await log_event(self.db, "INFO", "engine", "Engine started", {"venues": [v.value for v in self.adapters]})
         await asyncio.gather(*self._tasks)
 

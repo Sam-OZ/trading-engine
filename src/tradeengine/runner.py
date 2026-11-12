@@ -198,6 +198,8 @@ class StrategyRunner:
             for name, syms in enabled.items():
                 if sym not in syms:
                     continue
+                if await self._holding(name, sym):
+                    continue  # as in the backtest: a strategy looks for an entry only while it holds nothing
                 ok, why = self._enough_history(name, h1)
                 if not ok:
                     await log_event(self.e.db, "WARNING", "runner", f"{sym}: {why}; not trading it yet")
@@ -239,6 +241,13 @@ class StrategyRunner:
             return [f"opened {sig.side.value} {inst.symbol} ({name})"]
         why = "; ".join(decision.reasons) or (outcome.error if outcome else "needs approval")
         return [f"{name} {sig.side.value} {inst.symbol} not opened: {why}"]
+
+    async def _holding(self, strategy: str, sym: str) -> bool:
+        async with self.e.db.sessions() as s:
+            row = (await s.execute(select(PositionRow.id).where(
+                PositionRow.symbol == sym, PositionRow.strategy == strategy, PositionRow.status == PositionStatus.OPEN.value,
+            ).limit(1))).first()
+        return row is not None
 
     async def _open_strategy_symbols(self) -> set[str]:
         async with self.e.db.sessions() as s:

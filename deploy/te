@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# `sudo te <tradeengine command>` on the server: runs the CLI as the service user, with the deploy-time
+# keys and paths, against the live database. Examples: sudo te status; sudo te kill "reason".
+set -euo pipefail
+[ "$(id -u)" = 0 ] || { echo "run as: sudo te $*" >&2; exit 1; }
+set -a; . /etc/tradeengine/env; . /etc/tradeengine/uv.env; set +a
+cd /opt/tradeengine/current
+exec setpriv --reuid=trader --regid=trader --init-groups env HOME=/var/lib/tradeengine \
+  /usr/local/bin/uv run --frozen --no-dev tradeengine "$@"

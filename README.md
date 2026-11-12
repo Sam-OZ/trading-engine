@@ -41,11 +41,13 @@ src/tradeengine/
   portfolio.py       portfolio backtest: all instruments together through the live risk limits
   round2.py          research-round machinery (plan, walk-forward, frozen basket, one-look lock) + round 2's plan
   round3.py          round 3's plan (crypto only)
+  notify.py          Telegram alerts and daily summary (read from the event log)
   runner.py          hourly live runner: signals + trail/exits on each strategy's own bars (off until gate2-apply)
   gate1.py           live demo checks for Gate 1
   cli.py             `tradeengine` command
 tests/               unit tests (no network; brokers are mocked)
-scripts/             with-secrets.sh, gate1.sh, phase2.sh, round2.sh, round3.sh
+scripts/             with-secrets.sh, gate1.sh, phase2.sh, round2.sh, round3.sh, vm.sh (the server)
+deploy/              server install: systemd service, `te` helper, nightly backup
 ```
 
 ## One-time setup on your Mac
@@ -179,6 +181,31 @@ uv run tradeengine round3 --holdout data/reports/round3-dev-<time>/result.json
 ```
 
 If nothing passes, strategy research stops: evidence after round 3 comes only from demo forward tests.
+
+## Phase 3: the server and the forward test (Binance demo)
+
+Round 3's `tsmom_fast_d1` (crypto fast momentum) passed its holdout and is forward-tested on the Binance
+DEMO account by one always-free e2-micro VM. Only the Binance demo keys and the Telegram bot token go to
+the server, once per deploy, into a root-only file; the server never calls Secret Manager.
+
+```bash
+cd ~/Downloads/Source_Code/Crypto_Forex
+./scripts/vm.sh create                 # once: VM, backup bucket, IAP-only SSH firewall
+./scripts/vm.sh deploy                 # committed code -> server, keys loaded, service restarted
+./scripts/vm.sh te telegram-setup      # after sending the bot any message in Telegram
+./scripts/vm.sh apply data/reports/round3-holdout-20261112-195307/result.json tsmom_fast_d1
+./scripts/vm.sh te status              # accounts, positions, kill switch
+./scripts/vm.sh logs                   # last 200 log lines
+./scripts/vm.sh te kill "reason"       # stop new orders (stops stay at Binance)
+```
+
+Telegram: every open and close, problems (warnings from execution, reconciler, risk, kill switch;
+all errors), and a daily summary at 00:30 UTC (08:30 Perth) with the forward test's tally. The journal
+is copied to `gs://televita-trading-backups` at 03:15 UTC every night (kept 30 days).
+
+Forward-test bar (fixed before switch-on): first 8 weeks, stops always at Binance, reconciler clean,
+backtest re-run over the same weeks matches the live trades; money judged at 12 months or 40 trades
+(whichever later): PF >= 1.0, drawdown < 10%, kill switch never reached. Nothing is tuned during the test.
 
 ## Everyday commands
 

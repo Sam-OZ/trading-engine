@@ -1,0 +1,22 @@
+[Unit]
+Description=Trading engine (demo accounts only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=trader
+Group=trader
+WorkingDirectory=/opt/tradeengine/current
+# Secrets: root-only file written by scripts/vm.sh at deploy time. The server never calls Secret Manager.
+EnvironmentFile=/etc/tradeengine/env
+EnvironmentFile=/etc/tradeengine/uv.env
+ExecStart=/usr/local/bin/uv run --frozen --no-dev tradeengine run
+Restart=always
+RestartSec=30
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/tradeengine /opt/tradeengine/cache /opt/tradeengine/python
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
