@@ -90,7 +90,7 @@ class BinanceSpotDemoAdapter:
     # ------------------------------------------------------------------ plumbing
     async def connect(self) -> None:
         r = await self._trade.get("/api/v3/time")
-        r.raise_for_status()
+        _check(r, "/api/v3/time")
         self._time_offset_ms = int(r.json()["serverTime"]) - int(time.time() * 1000)
 
     async def close(self) -> None:
@@ -454,7 +454,16 @@ class BinanceSpotDemoAdapter:
                 await asyncio.sleep(delay)
 
 
+RESTRICTED_LOCATION = (
+    "Binance refuses connections from this computer's country (HTTP 451, restricted location). "
+    "Binance blocks the United States, including US cloud servers: run the engine from an allowed "
+    "country (the server lives in Melbourne for this reason)."
+)
+
+
 def _check(r: httpx.Response, path: str):
+    if r.status_code == 451:
+        raise BrokerError(f"Binance {path}: {RESTRICTED_LOCATION}", status=451)
     if r.status_code >= 500:
         raise BrokerError(f"Binance {path} server error {r.status_code}", status=r.status_code, retryable=True)
     if r.status_code >= 400:

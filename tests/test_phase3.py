@@ -289,3 +289,60 @@ def test_the_cli_installs_the_redaction_on_start(tmp_path, monkeypatch, capsys):
     cli_main(["settings"])
     capsys.readouterr()
     assert any(isinstance(f, RedactFilter) for h in logging.getLogger().handlers for f in h.filters)
+
+
+# ------------------------------------------------------------------ telegram-test
+@respx.mock
+def test_telegram_test_sends_one_message_to_the_saved_chat(tmp_path, monkeypatch, capsys):
+    from tradeengine.cli import main as cli_main
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{tmp_path / 'e.db'}")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "T")
+    with pytest.raises(SystemExit) as e:  # nothing linked yet: a clear instruction, no Telegram call
+        cli_main(["telegram-test"])
+    assert "telegram-setup" in str(e.value)
+    cli_main(["settings", "--set", "telegram_chat_id=\"777\"", "telegram_alerts_enabled=true"])
+    capsys.readouterr()
+    sent = respx.post("https://api.telegram.org/botT/sendMessage").mock(return_value=httpx.Response(200, json={"ok": True}))
+    cli_main(["telegram-test"])
+    assert "Test message sent to chat 777" in capsys.readouterr().out and sent.call_count == 1
+    body = json.loads(sent.calls[0].request.content)
+    assert body["chat_id"] == "777" and "Alerts are ON" in body["text"]
+
+
+@respx.mock
+def test_telegram_test_explains_a_revoked_token_without_showing_it(tmp_path, monkeypatch, capsys):
+    from tradeengine.cli import main as cli_main
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{tmp_path / 'e.db'}")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", TOKEN)
+    cli_main(["settings", "--set", "telegram_chat_id=\"777\""])
+    capsys.readouterr()
+    respx.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage").mock(return_value=httpx.Response(401))
+    with pytest.raises(SystemExit) as e:
+        cli_main(["telegram-test"])
+    assert "401" in str(e.value) and "revoked" in str(e.value) and TOKEN not in str(e.value)
+
+
+# ------------------------------------------------------------------ Binance location block
+@respx.mock
+async def test_binance_location_block_gives_a_plain_reason():
+    from tradeengine.brokers.base import BrokerError
+    from tradeengine.brokers.binance import DEMO_TRADE_REST, BinanceSpotDemoAdapter
+    from tradeengine.models import DEFAULT_INSTRUMENTS
+
+    respx.get(f"{DEMO_TRADE_REST}/api/v3/time").mock(return_value=httpx.Response(451, json={
+        "code": 0, "msg": "Service unavailable from a restricted location"}))
+    a = BinanceSpotDemoAdapter("K", "S", list(DEFAULT_INSTRUMENTS.values()))
+    with pytest.raises(BrokerError) as e:
+        await a.connect()
+    await a.close()
+    assert e.value.status == 451 and "restricted location" in str(e.value) and "United States" in str(e.value)
+
+
+def test_server_vm_is_outside_the_us_and_backups_stay_free():
+    s = (Path(__file__).parent.parent / "scripts" / "vm.sh").read_text()
+    assert 'ZONE="${ZONE:-australia-southeast2-a}"' in s and 'BUCKET_REGION="us-central1"' in s
+    assert "--boot-disk-size=10GB" in s and "us-central1-a" not in s

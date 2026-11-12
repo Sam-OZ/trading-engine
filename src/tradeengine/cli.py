@@ -16,6 +16,7 @@
   round3 --dev / --holdout <json>      round 3 (crypto only), same rules of play
   gate2-apply <json> [--only S]   switch on the strategies that passed (Gate 2 or a round holdout result)
   telegram-setup          link the alerts bot to your Telegram chat (send the bot a message first)
+  telegram-test           send a test message to the linked chat (checks the token and the chat id)
 """
 
 from __future__ import annotations
@@ -486,6 +487,35 @@ async def cmd_telegram_setup(_args) -> None:
     print(f"Telegram alerts on: chat {chat_id} ({who}). A test message was sent.")
 
 
+async def cmd_telegram_test(_args) -> None:
+    """Send one test message with the saved chat id and the current token. Changes nothing."""
+    import socket
+
+    from .notify import TelegramError, send
+
+    cfg = load_config()
+    if cfg.telegram_bot_token is None:
+        sys.exit("TELEGRAM_BOT_TOKEN is not set (run through scripts/with-secrets.sh, or on the server).")
+    eng = _engine(need_brokers=False)
+    try:
+        await eng.db.create_all()
+        settings = await eng.settings_store.load()
+    finally:
+        await eng.stop()
+    if not settings.telegram_chat_id:
+        sys.exit("No chat linked yet. Send the bot any message in Telegram, then run `tradeengine telegram-setup`.")
+    text = (f"🔔 Test from the trading engine on {socket.gethostname()} "
+            f"({datetime.now(UTC):%Y-%m-%d %H:%M} UTC). Alerts are "
+            f"{'ON' if settings.telegram_alerts_enabled else 'OFF'}.")
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            await send(client, cfg.telegram_bot_token.get_secret_value(), settings.telegram_chat_id, text)
+    except TelegramError as e:
+        sys.exit(f"Telegram refused the test message: {e}. "
+                 "A 401 means the token is wrong or revoked; a 400/403 means the chat id is wrong or the bot was blocked.")
+    print(f"Test message sent to chat {settings.telegram_chat_id}. Check Telegram.")
+
+
 def main(argv: list[str] | None = None) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     from .logsafe import install as _redact_logs
@@ -530,6 +560,7 @@ def main(argv: list[str] | None = None) -> None:
     ga.add_argument("--dry-run", action="store_true")
     ga.add_argument("--only", action="append", metavar="STRATEGY", help="switch on only this strategy (repeatable)")
     sub.add_parser("telegram-setup")
+    sub.add_parser("telegram-test")
     args = p.parse_args(argv)
     handler = {
         "status": cmd_status,
@@ -546,6 +577,7 @@ def main(argv: list[str] | None = None) -> None:
         "round2": cmd_round2,
         "round3": cmd_round3,
         "telegram-setup": cmd_telegram_setup,
+        "telegram-test": cmd_telegram_test,
         "gate2-apply": cmd_gate2_apply,
     }[args.cmd]
     asyncio.run(handler(args))

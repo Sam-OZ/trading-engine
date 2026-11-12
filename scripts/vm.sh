@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# The Phase 3 server: one always-free e2-micro (us-central1) running `tradeengine run` 24/7 on the
-# Binance DEMO account. Run from your Mac:
+# The Phase 3 server: one e2-micro in MELBOURNE (australia-southeast2) running `tradeengine run` 24/7 on
+# the Binance DEMO account. Not the US always-free tier: Binance refuses US addresses (HTTP 451), so the
+# server must sit in an allowed country (about US$8/month). Backups stay in the free US bucket. Run from your Mac:
 #
 #   ./scripts/vm.sh create            once: service account, backup bucket, firewall, the VM
 #   ./scripts/vm.sh deploy            committed code -> server; keys read from Secret Manager ONCE and
@@ -8,6 +9,7 @@
 #   ./scripts/vm.sh te <command>      run a tradeengine command on the server, e.g. `te status`,
 #                                     `te telegram-setup`, `te kill "reason"`, `te settings`
 #   ./scripts/vm.sh apply <result.json> <strategy>   switch on one strategy from a holdout result
+#   ./scripts/vm.sh telegram-test     send a test message to your Telegram chat
 #   ./scripts/vm.sh logs              last 200 lines of the engine's log
 #   ./scripts/vm.sh backup            run the nightly backup now
 #   ./scripts/vm.sh ssh               a shell on the server
@@ -18,8 +20,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 PROJECT="${GCP_PROJECT:-televita-trading}"
-REGION="us-central1"
-ZONE="${ZONE:-us-central1-a}"
+BUCKET_REGION="us-central1"                   # backups: Cloud Storage always-free tier (US regions only)
+ZONE="${ZONE:-australia-southeast2-a}"         # the VM: Melbourne, where Binance accepts connections
 VM="${VM:-trading-engine}"
 SA_NAME="trading-vm"
 SA="$SA_NAME@$PROJECT.iam.gserviceaccount.com"
@@ -44,9 +46,9 @@ cmd_create() {
   echo "== Service account for the VM (no roles; only bucket write below) =="
   g iam service-accounts describe "$SA" >/dev/null 2>&1 \
     || g iam service-accounts create "$SA_NAME" --display-name="Trading engine VM (backups only)"
-  echo "== Backup bucket: $BUCKET ($REGION, private, files deleted after 30 days) =="
+  echo "== Backup bucket: $BUCKET ($BUCKET_REGION, private, files deleted after 30 days) =="
   if ! g storage buckets describe "gs://$BUCKET" >/dev/null 2>&1; then
-    g storage buckets create "gs://$BUCKET" --location="$REGION" --uniform-bucket-level-access --public-access-prevention
+    g storage buckets create "gs://$BUCKET" --location="$BUCKET_REGION" --uniform-bucket-level-access --public-access-prevention
     printf '{"rule":[{"action":{"type":"Delete"},"condition":{"age":30}}]}' > /tmp/te-lifecycle.json
     g storage buckets update "gs://$BUCKET" --lifecycle-file=/tmp/te-lifecycle.json
     rm -f /tmp/te-lifecycle.json
@@ -70,11 +72,11 @@ cmd_create() {
   for rule in default-allow-ssh default-allow-rdp; do
     g compute firewall-rules describe "$rule" >/dev/null 2>&1 && g compute firewall-rules delete "$rule"
   done
-  echo "== VM: $VM (e2-micro, 30 GB standard disk = always-free tier) =="
+  echo "== VM: $VM in $ZONE (e2-micro, 10 GB standard disk) =="
   if ! g compute instances describe "$VM" --zone="$ZONE" >/dev/null 2>&1; then
     g compute instances create "$VM" --zone="$ZONE" --machine-type=e2-micro \
       --image-family=debian-12 --image-project=debian-cloud \
-      --boot-disk-size=30GB --boot-disk-type=pd-standard \
+      --boot-disk-size=10GB --boot-disk-type=pd-standard \
       --service-account="$SA" --scopes=cloud-platform \
       --metadata=enable-oslogin=TRUE --shielded-secure-boot --shielded-vtpm --shielded-integrity-monitoring
   fi
@@ -129,6 +131,7 @@ cmd_apply() {
     && sudo te gate2-apply /var/lib/tradeengine/data/holdout-result.json --only $(printf '%q' "$2")"
 }
 
+cmd_telegram_test() { remote "sudo te telegram-test"; }
 cmd_logs() { remote "sudo journalctl -u tradeengine -n 200 --no-pager"; }
 cmd_backup() { remote "sudo systemctl start tradeengine-backup && sudo journalctl -u tradeengine-backup -n 3 --no-pager"; }
 cmd_ssh() { g compute ssh "$VM" --zone="$ZONE" --tunnel-through-iap; }
@@ -138,8 +141,9 @@ case "${1:-}" in
   deploy) cmd_deploy ;;
   te) shift; cmd_te "$@" ;;
   apply) shift; cmd_apply "$@" ;;
+  telegram-test) cmd_telegram_test ;;
   logs) cmd_logs ;;
   backup) cmd_backup ;;
   ssh) cmd_ssh ;;
-  *) sed -n '2,20p' "$0"; exit 1 ;;
+  *) sed -n '2,22p' "$0"; exit 1 ;;
 esac
