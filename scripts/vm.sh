@@ -10,6 +10,7 @@
 #                                     `te telegram-setup`, `te kill "reason"`, `te settings`
 #   ./scripts/vm.sh apply <result.json> <strategy>   switch on one strategy from a holdout result
 #   ./scripts/vm.sh telegram-test     send a test message to your Telegram chat
+#   ./scripts/vm.sh follow-freeze <selection.json>   round 4 Track A: freeze the chosen traders (once)
 #   ./scripts/vm.sh logs              last 200 lines of the engine's log
 #   ./scripts/vm.sh backup            run the nightly backup now
 #   ./scripts/vm.sh ssh               a shell on the server
@@ -132,6 +133,13 @@ cmd_apply() {
 }
 
 cmd_telegram_test() { remote "sudo te telegram-test"; }
+
+cmd_follow_freeze() {
+  [ $# -eq 1 ] || { echo "usage: ./scripts/vm.sh follow-freeze <round4-follow-selection.json>" >&2; exit 1; }
+  g compute scp "$1" "$VM:/tmp/follow-selection.json" --zone="$ZONE" --tunnel-through-iap
+  remote "sudo install -o trader -m 640 /tmp/follow-selection.json /var/lib/tradeengine/data/follow-selection.json && rm /tmp/follow-selection.json \
+    && sudo te round4-follow --freeze /var/lib/tradeengine/data/follow-selection.json"
+}
 cmd_logs() { remote "sudo journalctl -u tradeengine -n 200 --no-pager"; }
 cmd_backup() { remote "sudo systemctl start tradeengine-backup && sudo journalctl -u tradeengine-backup -n 3 --no-pager"; }
 cmd_ssh() { g compute ssh "$VM" --zone="$ZONE" --tunnel-through-iap; }
@@ -142,8 +150,9 @@ case "${1:-}" in
   te) shift; cmd_te "$@" ;;
   apply) shift; cmd_apply "$@" ;;
   telegram-test) cmd_telegram_test ;;
+  follow-freeze) shift; cmd_follow_freeze "$@" ;;
   logs) cmd_logs ;;
   backup) cmd_backup ;;
   ssh) cmd_ssh ;;
-  *) sed -n '2,22p' "$0"; exit 1 ;;
+  *) sed -n '2,23p' "$0"; exit 1 ;;
 esac

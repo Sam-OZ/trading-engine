@@ -230,6 +230,10 @@ class Engine:
         self._tasks.append(asyncio.create_task(self._loop(self.refresh_accounts, 60, "account refresh"), name="equity"))
         self._tasks.append(asyncio.create_task(self._loop(self._heartbeat, 15, "heartbeat"), name="heartbeat"))
         self._tasks.append(asyncio.create_task(StrategyRunner(self).run_forever(), name="strategies"))
+        # Round 4 Track A: a read-only hourly record of the followed traders; idle until a selection is frozen.
+        from .round4_follow import FollowWatcher
+
+        self._tasks.append(asyncio.create_task(FollowWatcher(self).run_forever(), name="round4-follow"))
         self.start_notifier()
         await log_event(self.db, "INFO", "engine", "Engine started", {"venues": [v.value for v in self.adapters]})
         await asyncio.gather(*self._tasks)

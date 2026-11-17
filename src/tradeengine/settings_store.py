@@ -44,6 +44,9 @@ class RuntimeSettings(BaseModel):
     # A brief broker outage (HTTP 5xx, rate limit, timeout) is retried quietly; Telegram is told only when the
     # same job has kept failing this long (0 = at once), and again when it recovers.
     transient_alert_minutes: float = Field(3.0, ge=0, le=120)
+    # Round 4 Track A: record the frozen traders' positions hourly and keep the shadow (never-sent) copy trades.
+    # Only does anything once a selection is frozen (`tradeengine round4-follow --freeze`). Off = recording pauses.
+    round4_follow_enabled: bool = True
 
     # --- Strategies (all OFF until they pass Gate 2; set with `tradeengine gate2-apply`) ---
     strategies_enabled: dict[str, list[str]] = {}  # strategy -> symbols it may trade

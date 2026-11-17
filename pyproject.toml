@@ -27,6 +27,14 @@ dev = [
   "pytest-asyncio>=0.23",
   "respx>=0.21",
 ]
+# Round 4 Track B only: the Kronos forecasting model (run on a desktop; the server never installs this).
+kronos = [
+  "torch>=2.0",
+  "einops>=0.8",
+  "huggingface_hub>=0.33",
+  "safetensors>=0.6",
+  "tqdm>=4.66",
+]
 
 [project.scripts]
 tradeengine = "tradeengine.cli:main"

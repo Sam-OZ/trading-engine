@@ -165,6 +165,50 @@ class CandleRow(Base):
     volume: Mapped[Decimal] = mapped_column(PRICE, default=Decimal("0"))
 
 
+class FollowSnapshotRow(Base):
+    """Round 4 Track A: one followed trader's open positions, recorded once an hour (read-only, public data)."""
+
+    __tablename__ = "follow_snapshots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    address: Mapped[str] = mapped_column(String(64), index=True)
+    account_value: Mapped[Decimal] = mapped_column(PRICE)
+    positions: Mapped[dict] = mapped_column(JSON)  # coin -> {"szi": signed size, "value": USD notional}
+
+
+class ShadowTradeRow(Base):
+    """Round 4 Track A: a copy trade that was only recorded, never sent. Scored at the end of the record."""
+
+    __tablename__ = "shadow_trades"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    coin: Mapped[str] = mapped_column(String(32))
+    symbol: Mapped[str] = mapped_column(String(32))  # Binance USDⓈ-M futures symbol
+    side: Mapped[str] = mapped_column(String(4))
+    opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    entry: Mapped[Decimal] = mapped_column(PRICE)
+    stop: Mapped[Decimal] = mapped_column(PRICE)
+    size: Mapped[Decimal] = mapped_column(PRICE)
+    risk_usd: Mapped[Decimal] = mapped_column(PRICE)
+    reason: Mapped[str] = mapped_column(String(128))
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    exit: Mapped[Decimal | None] = mapped_column(PRICE, nullable=True)
+    exit_reason: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    fees: Mapped[Decimal | None] = mapped_column(PRICE, nullable=True)
+    funding: Mapped[Decimal | None] = mapped_column(PRICE, nullable=True)
+    pnl: Mapped[Decimal | None] = mapped_column(PRICE, nullable=True)  # after fees and funding
+    r: Mapped[float | None] = mapped_column(Numeric(18, 6), nullable=True)
+
+
+class ShadowEquityRow(Base):
+    __tablename__ = "shadow_equity"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    equity: Mapped[Decimal] = mapped_column(PRICE)
+
+
 class Database:
     def __init__(self, url: str):
         sqlite = url.startswith("sqlite")

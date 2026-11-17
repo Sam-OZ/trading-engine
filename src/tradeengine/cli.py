@@ -17,6 +17,11 @@
   gate2-apply <json> [--only S]   switch on the strategies that passed (Gate 2 or a round holdout result)
   telegram-setup          link the alerts bot to your Telegram chat (send the bot a message first)
   telegram-test           send a test message to the linked chat (checks the token and the chat id)
+  round4-kronos --forecast [--limit N]   round 4 Track B: build the Kronos forecasts (resumable; needs --extra kronos)
+  round4-kronos --score                  round 4 Track B: the one look, Kronos vs C2 over Aug 2025 - Oct 2026
+  round4-follow --select                 round 4 Track A: pick the traders to follow (desktop; writes a JSON file)
+  round4-follow --freeze <selection.json>  store that selection on the server, once; the shadow record starts
+  round4-follow --status | --score       Track A shadow tally; the one-look score (after 90 days and 40 trades)
 """
 
 from __future__ import annotations
@@ -361,6 +366,82 @@ async def cmd_round3(args) -> None:
     await _cmd_round(args, 3)
 
 
+async def cmd_round4_follow(args) -> None:
+    """Round 4 Track A: select (desktop), freeze (server, once), status, score (once)."""
+    from . import round4_follow as r4f
+
+    cfg = load_config()
+    if args.select:
+        async with httpx.AsyncClient(timeout=60, headers={"User-Agent": "tradeengine-follow"}) as client:
+            sel = await r4f.select_traders(r4f.Hyperliquid(client), r4f.FuturesMarket(client))
+        out = Path(args.out or cfg.data_dir / "reports" / f"round4-follow-selection-{datetime.now():%Y%m%d-%H%M%S}.json")
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(sel, indent=2))
+        print(f"Scanned {sel['scanned']}; chosen {len(sel['traders'])}; not chosen: {sel['rejected']}")
+        for t in sel["traders"]:
+            print(f"  {t['address']} {(t.get('name') or '')[:20]:<20} realised ${t['realised_pnl']:>14,.0f} | "
+                  f"{t['fills_per_day']} fills/day | {t['span_days']} days kept | {t['coverage']:.0%} on Binance futures")
+        print(f"Saved {out}. Next: ./scripts/vm.sh follow-freeze {out}")
+        return
+    eng = _engine(need_brokers=False)
+    try:
+        await eng.db.create_all()
+        if args.freeze:
+            try:
+                v = await r4f.freeze(eng.db, json.loads(Path(args.freeze).read_text()))
+            except (ValueError, RuntimeError) as e:
+                sys.exit(f"Not frozen: {e}")
+            print(f"Frozen {len(v['traders'])} traders at {v['frozen_at']}. The hourly shadow record starts with the engine's next hour.")
+            return
+        st = await r4f.stats(eng.db)
+        if st is None:
+            sys.exit("Track A has no frozen selection yet (round4-follow --select on your Mac, then vm.sh follow-freeze).")
+        if args.status:
+            print(r4f.summary_line(st))
+            print(f"Recorded for {st.days:.1f} days; the score needs {r4f.MIN_RECORD_DAYS} days and {r4f.RULES.holdout_min_trades} closed trades.")
+            return
+        try:
+            ok, why, st = await r4f.score(eng.db)
+        except RuntimeError as e:
+            sys.exit(str(e))
+        print(r4f.summary_line(st))
+        print("TRACK A: PASS" if ok else "TRACK A: FAIL - " + "; ".join(why))
+    finally:
+        await eng.stop()
+
+
+async def cmd_round4_kronos(args) -> None:
+    """Round 4 Track B. --forecast builds and caches forecasts (stop and rerun at will); --score is the one look."""
+    from . import round4_kronos as r4k
+
+    cfg = load_config()
+    if args.forecast:
+        data, notes = r4k.load_data(cfg.data_dir, DEFAULT_INSTRUMENTS)
+        for n in notes:
+            print(n)
+        daily = {s: r4k.daily_frame(data[s][0]) for s in r4k.SYMBOLS}
+        print(f"Loading {r4k.MODEL_ID} (downloaded from Hugging Face the first time) ...")
+        fc = r4k.Forecaster(device=args.device)
+        print(f"Running on {fc.device}.")
+        r4k.make_forecasts(daily, fc, r4k.cache_path(cfg.data_dir), limit=args.limit)
+        left = {s: n for s, n in r4k.missing_forecasts(daily, r4k.load_cache(r4k.cache_path(cfg.data_dir))).items() if n}
+        print("Every forecast is ready: run `uv run tradeengine round4-kronos --score` (the one look)." if not left
+              else f"Still to do: {left}. Run the same command again to continue.")
+        return
+    eng = _engine(need_brokers=False)
+    try:
+        await eng.db.create_all()
+        settings = await eng.settings_store.load()
+        print("SCORE: one look, ever, at Kronos over Aug 2025 - Oct 2026. The result is locked once shown.")
+        if not args.yes and input("Type SCORE to run it now: ").strip() != "SCORE":
+            sys.exit("Not run.")
+        v, out = await r4k.score(cfg.data_dir, settings, DEFAULT_INSTRUMENTS, eng.db)
+        print((out / "report.md").read_text())
+        print(f"Report folder: {out}")
+    finally:
+        await eng.stop()
+
+
 async def _cmd_round(args, number: int) -> None:
     """A pre-registered research round: `--dev` (check 1) or `--holdout <dev result.json>` (check 2, once)."""
     from . import round2 as r2
@@ -563,6 +644,20 @@ def main(argv: list[str] | None = None) -> None:
     mode3.add_argument("--dev", action="store_true", help="crypto development run (check 1)")
     mode3.add_argument("--holdout", metavar="DEV_RESULT_JSON", help="the one crypto holdout run (check 2)")
     r3p.add_argument("--yes", action="store_true", help="skip the HOLDOUT confirmation")
+    r4f = sub.add_parser("round4-follow")
+    mode4f = r4f.add_mutually_exclusive_group(required=True)
+    mode4f.add_argument("--select", action="store_true", help="pick the traders (desktop; ~1 hour, read-only)")
+    mode4f.add_argument("--freeze", metavar="SELECTION_JSON", help="store the selection, once")
+    mode4f.add_argument("--status", action="store_true", help="the shadow tally so far")
+    mode4f.add_argument("--score", action="store_true", help="the one-look score")
+    r4f.add_argument("--out", default=None, help="where --select writes its JSON")
+    r4k = sub.add_parser("round4-kronos")
+    mode4 = r4k.add_mutually_exclusive_group(required=True)
+    mode4.add_argument("--forecast", action="store_true", help="build the Kronos forecasts (resumable)")
+    mode4.add_argument("--score", action="store_true", help="the one look: Kronos vs C2 over the scored window")
+    r4k.add_argument("--limit", type=int, default=None, help="forecast at most this many days this run")
+    r4k.add_argument("--device", default=None, help="cpu / mps / cuda:0 (default: picked automatically)")
+    r4k.add_argument("--yes", action="store_true", help="skip the SCORE confirmation")
     ga = sub.add_parser("gate2-apply")
     ga.add_argument("result", help="data/reports/gate2-.../result.json")
     ga.add_argument("--dry-run", action="store_true")
@@ -584,6 +679,8 @@ def main(argv: list[str] | None = None) -> None:
         "gate2": cmd_gate2,
         "round2": cmd_round2,
         "round3": cmd_round3,
+        "round4-kronos": cmd_round4_kronos,
+        "round4-follow": cmd_round4_follow,
         "telegram-setup": cmd_telegram_setup,
         "telegram-test": cmd_telegram_test,
         "gate2-apply": cmd_gate2_apply,

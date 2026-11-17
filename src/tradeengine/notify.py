@@ -133,6 +133,15 @@ async def summary_text(engine, now: datetime) -> str:
         pf = f"{wins / losses:.2f}" if losses > 0 else ("n/a" if not pnl else "all wins")
         lines.append(f"Forward test since {start.value['at'][:10]} ({', '.join(start.value.get('strategies', []))}): "
                      f"{len(ft)} closed trades, P&L {sum(pnl, Decimal(0)):+.2f}, profit factor {pf}")
+    try:  # round 4 Track A shadow tally, once its traders are frozen; never let it break the summary
+        from .round4_follow import stats as follow_stats
+        from .round4_follow import summary_line
+
+        st = await follow_stats(engine.db, now)
+        if st is not None:
+            lines.append(summary_line(st))
+    except Exception as e:
+        log.warning("Track A summary line failed: %s", e)
     lines.append(f"Errors in the last 24 h: {n_events}")
     return "\n".join(lines)
 
