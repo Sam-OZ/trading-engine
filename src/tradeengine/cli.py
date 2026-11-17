@@ -377,11 +377,16 @@ async def cmd_round4_follow(args) -> None:
         out = Path(args.out or cfg.data_dir / "reports" / f"round4-follow-selection-{datetime.now():%Y%m%d-%H%M%S}.json")
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(sel, indent=2))
-        print(f"Scanned {sel['scanned']}; chosen {len(sel['traders'])}; not chosen: {sel['rejected']}")
+        print(f"Scanned {sel['scanned']}: {sel['qualified']} qualify, {len(sel['traders'])} chosen; not chosen: {sel['rejected']}")
+        if sel["unread"]:
+            print(f"Could not read {sel['unread']} accounts even after a retry: {sel['unread_errors']}")
+        if sel["unread"] > r4f.MAX_UNREAD_SHARE * sel["scanned"]:
+            print(f"INCOMPLETE: more than {r4f.MAX_UNREAD_SHARE:.0%} unread, so this list cannot be frozen. Run --select again later.")
         for t in sel["traders"]:
             print(f"  {t['address']} {(t.get('name') or '')[:20]:<20} realised ${t['realised_pnl']:>14,.0f} | "
                   f"{t['fills_per_day']} fills/day | {t['span_days']} days kept | {t['coverage']:.0%} on Binance futures")
-        print(f"Saved {out}. Next: ./scripts/vm.sh follow-freeze {out}")
+        print(f"Saved {out}." + ("" if sel["unread"] > r4f.MAX_UNREAD_SHARE * sel["scanned"]
+                                 else f" Next: ./scripts/vm.sh follow-freeze {out}"))
         return
     eng = _engine(need_brokers=False)
     try:

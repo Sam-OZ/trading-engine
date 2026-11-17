@@ -7,7 +7,9 @@ import json
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
+import httpx
 import pytest
+import respx
 from conftest import FakeAdapter
 from sqlalchemy import select
 
@@ -281,3 +283,56 @@ async def test_score_waits_for_90_days_and_40_trades_then_locks(eng):
     assert ok and why == [] and st.closed == 40 and st.profit_factor == pytest.approx(34.4 / 16.0)
     with pytest.raises(RuntimeError, match="already scored"):
         await r4f.score(eng.db, datetime.now(UTC) + timedelta(days=92))
+
+
+# ------------------------------------------------------------------ an unreliable connection must not skew the selection
+@respx.mock
+async def test_hyperliquid_calls_retry_hiccups_and_fail_fast_on_real_errors():
+    waits = []
+
+    async def no_wait(s):
+        waits.append(s)
+
+    route = respx.post(r4f.HL_INFO).mock(side_effect=[httpx.Response(403), httpx.Response(502), httpx.ConnectError("x"),
+                                                      httpx.Response(200, text="<html>"), httpx.Response(200, json=[1, 2])])
+    async with httpx.AsyncClient() as client:
+        hl = r4f.Hyperliquid(client, sleep=no_wait)
+        assert await hl.info({"type": "portfolio", "user": "a"}) == [1, 2]
+        assert route.call_count == 5 and waits[:4] == [15, 30, 60, 120]  # then the normal pacing pause
+        route.side_effect = [httpx.Response(422, json={"error": "bad user"})]
+        with pytest.raises(httpx.HTTPStatusError):  # a real error is not retried
+            await hl.info({"type": "portfolio", "user": "b"})
+        route.side_effect = [httpx.Response(503)] * 6
+        with pytest.raises(httpx.HTTPError, match="kept failing \\(HTTP 503\\) for portfolio"):
+            await hl.info({"type": "portfolio", "user": "c"})
+
+
+async def test_unread_accounts_get_a_second_pass_and_an_incomplete_scan_cannot_be_frozen(eng):
+    now = datetime(2026, 11, 17, tzinfo=UTC)
+    old = int((now - timedelta(days=400)).timestamp() * 1000)
+
+    class Flaky(FakeHL):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self.fails = {"blip": 1, "dead": 99}
+
+        async def sleep(self, s):
+            pass
+
+        async def info(self, body):
+            if self.fails.get(body["user"], 0) > 0:
+                self.fails[body["user"]] -= 1
+                raise httpx.HTTPError("Hyperliquid kept failing (HTTP 403) for userFillsByTime")
+            return await super().info(body)
+
+    good = {"fills": fills(400, 300, pnl_each=8000), "pnl": window(2.5e6)}
+    hl = Flaky(leaderboard=[row(a, 2e6, 3e6, 1e5) for a in ("ok", "blip", "dead")],
+               fills={a: good["fills"] for a in ("ok", "blip", "dead")}, pnl={a: good["pnl"] for a in ("ok", "blip", "dead")},
+               first_seen={a: old for a in ("ok", "blip", "dead")})
+    sel = await r4f.select_traders(hl, FakeMarket(), now=now, progress=lambda m: None)
+    assert sorted(t["address"] for t in sel["traders"]) == ["blip", "ok"]  # "blip" recovered on the second pass
+    assert sel["unread"] == 1 and sel["unread_addresses"] == ["dead"]
+    assert sel["unread_errors"] == {"HTTPError: Hyperliquid kept failing (HTTP 403)": 1}
+    with pytest.raises(ValueError, match="could not read 1 of 3 accounts"):  # 33% unread: not a fair ranking
+        await r4f.freeze(eng.db, json.loads(json.dumps(sel)))
+    assert await r4f.load_selection(eng.db) is None

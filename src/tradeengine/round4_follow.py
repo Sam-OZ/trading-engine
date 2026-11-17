@@ -58,6 +58,7 @@ MIN_COVERAGE = 0.7
 MIN_COIN_QUOTE_VOLUME = 100e6
 MAX_TRADERS = 15
 MAX_SCAN = 600
+MAX_UNREAD_SHARE = 0.02  # a scan that could not read more than 2% of its candidates is incomplete: not freezable
 # --- copy rule (frozen) ---
 CONSENSUS_IN = 3
 CONSENSUS_HOLD = 2
@@ -83,7 +84,7 @@ SCORE_KEY = "round4_holdout:follow"
 
 
 FROZEN = ("MIN_ACCOUNT", "MIN_AGE_DAYS", "MAX_FILLS_PER_DAY", "MIN_CLOSING_FILLS", "MIN_SPAN_DAYS", "MIN_REALISED_SHARE",
-          "MAX_IDLE_DAYS", "MIN_COVERAGE", "MIN_COIN_QUOTE_VOLUME", "MAX_TRADERS", "MAX_SCAN", "CONSENSUS_IN", "CONSENSUS_HOLD",
+          "MAX_IDLE_DAYS", "MIN_COVERAGE", "MIN_COIN_QUOTE_VOLUME", "MAX_TRADERS", "MAX_SCAN", "MAX_UNREAD_SHARE", "CONSENSUS_IN", "CONSENSUS_HOLD",
           "MIN_POSITION_SHARE", "RISK_PCT", "STOP_ATR", "ATR_DAYS", "FEE_RATE", "SLIPPAGE_BPS", "START_EQUITY", "MAX_OPEN",
           "MAX_LEVERAGE", "DAILY_LOSS_PCT", "MAX_DD_PCT", "MIN_RECORD_DAYS")
 
@@ -104,25 +105,37 @@ def binance_base(coin: str) -> str | None:
 
 
 # ------------------------------------------------------------------ public data clients
+RETRY_STATUSES = {403, 408, 425, 429, 500, 502, 503, 504}  # rate limits, edge blocks and server hiccups
+RETRY_WAITS = (15, 30, 60, 120, 240)  # seconds; about 7.5 minutes before giving up on one call
+
+
 class Hyperliquid:
-    """Hyperliquid's public info API, paced under its 1,200 weight-a-minute limit; a 429 waits and retries."""
+    """Hyperliquid's public info API, paced under its 1,200 weight-a-minute limit. Rate limits, edge blocks,
+    server errors, dropped connections and unreadable replies wait and retry; anything else fails at once."""
 
     def __init__(self, client: httpx.AsyncClient, weight_per_min: float = 1000.0, sleep=asyncio.sleep):
         self.client, self.weight_per_min, self.sleep = client, weight_per_min, sleep
 
     async def info(self, body: dict) -> Any:
-        for attempt in range(6):
-            r = await self.client.post(HL_INFO, json=body)
-            if r.status_code == 429:
-                await self.sleep(15 * (attempt + 1))
-                continue
-            r.raise_for_status()
-            out = r.json()
-            weight = 20 + (len(out) // 20 if isinstance(out, list) and body["type"].startswith("userFills") else 0)
-            await self.sleep(weight * 60 / self.weight_per_min)
-            return out
-        r.raise_for_status()
-        raise httpx.HTTPError("Hyperliquid kept answering 429")
+        last = "no attempt"
+        for wait in (*RETRY_WAITS, None):
+            try:
+                r = await self.client.post(HL_INFO, json=body)
+                if r.status_code in RETRY_STATUSES:
+                    last = f"HTTP {r.status_code}"
+                else:
+                    r.raise_for_status()
+                    out = r.json()
+                    weight = 20 + (len(out) // 20 if isinstance(out, list) and body["type"].startswith("userFills") else 0)
+                    await self.sleep(weight * 60 / self.weight_per_min)
+                    return out
+            except (httpx.TransportError, ValueError) as e:  # timeouts, dropped connections, a non-JSON reply
+                last = f"{type(e).__name__}: {str(e)[:80]}"
+            if wait is None:
+                break
+            log.warning("Hyperliquid %s for %s: retrying in %ss", last, body["type"], wait)
+            await self.sleep(wait)
+        raise httpx.HTTPError(f"Hyperliquid kept failing ({last}) for {body['type']}")
 
     async def leaderboard(self) -> list[dict]:
         r = await self.client.get(HL_LEADERBOARD, timeout=300)
@@ -293,32 +306,56 @@ async def select_traders(hl: Hyperliquid, market: FuturesMarket, now: datetime |
                           "pnl_all": round(at["pnl"]), "pnl_month": round(mo["pnl"])})
     cands.sort(key=lambda c: -c["pnl_all"])
     progress(f"Leaderboard {len(rows)} rows; {len(cands)} profitable all-time and this month with >= ${MIN_ACCOUNT:,.0f}")
-    chosen, rejected, scanned = [], {}, 0
     week_ms = 7 * 86_400_000
-    for c in cands[:MAX_SCAN]:
-        scanned += 1
+
+    async def check(c: dict) -> tuple[str, str | None]:
+        """('chosen' | rejection category | 'unread', error detail)."""
         try:
             recent = await hl.info({"type": "userFillsByTime", "user": c["address"],
                                     "startTime": int(now.timestamp() * 1000) - week_ms, "aggregateByTime": True})
             if len(recent) >= 2000 or len(recent) / 7 > MAX_FILLS_PER_DAY:
-                rejected["bot or market maker"] = rejected.get("bot or market maker", 0) + 1
-                continue
+                return "bot or market maker", None
             pf = await hl.info({"type": "portfolio", "user": c["address"]})
             all_time = next((d for n, d in pf if n == "allTime"), {})
             first = (all_time.get("accountValueHistory") or [[None]])[0][0]
             why = assess(c, await fill_history(hl, c["address"]), first, liquid, now, all_time.get("pnlHistory") or [])
-        except Exception as e:  # one unreadable account must not stop the scan
-            why = [f"error {type(e).__name__}"]
-        if why:
-            key = _category(why[0])
-            rejected[key] = rejected.get(key, 0) + 1
-            continue
-        chosen.append(c)
-        progress(f"  scanned {scanned}: {len(chosen)} chosen")
+        except Exception as e:  # one unreadable account must not stop the scan; it is retried at the end
+            return "unread", f"{type(e).__name__}: {str(e)[:160]}"
+        return ("chosen", None) if not why else (_category(why[0]), None)
+
+    chosen, rejected, unread = [], {}, []
+    pool = cands[:MAX_SCAN]
+    for n, c in enumerate(pool, 1):
+        verdict, err = await check(c)
+        if verdict == "chosen":
+            chosen.append(c)
+        elif verdict == "unread":
+            unread.append((c, err))
+        else:
+            rejected[verdict] = rejected.get(verdict, 0) + 1
+        if n % 25 == 0 or n == len(pool):
+            progress(f"  scanned {n} of {len(pool)}: {len(chosen)} qualify, {len(unread)} could not be read yet")
+    if unread:  # one more pass for the accounts that failed, after a pause
+        progress(f"Retrying {len(unread)} accounts that could not be read ...")
+        await hl.sleep(120)
+        retry, unread = unread, []
+        for c, _ in retry:
+            verdict, err = await check(c)
+            if verdict == "chosen":
+                chosen.append(c)
+            elif verdict == "unread":
+                unread.append((c, err))
+            else:
+                rejected[verdict] = rejected.get(verdict, 0) + 1
     chosen.sort(key=lambda c: -c["realised_pnl"])
-    chosen = chosen[:MAX_TRADERS]
-    return {"selected_at": now.isoformat(timespec="seconds"), "scanned": scanned, "rejected": rejected,
-            "traders": chosen, "coins": sorted(liquid), "rules": rules_dict()}
+    errors: dict[str, int] = {}
+    for _, err in unread:
+        key = (err or "?").split(" for ")[0][:120]
+        errors[key] = errors.get(key, 0) + 1
+    return {"selected_at": now.isoformat(timespec="seconds"), "scanned": len(pool), "qualified": len(chosen),
+            "rejected": rejected, "unread": len(unread), "unread_errors": errors,
+            "unread_addresses": [c["address"] for c, _ in unread],
+            "traders": chosen[:MAX_TRADERS], "coins": sorted(liquid), "rules": rules_dict()}
 
 
 # ------------------------------------------------------------------ 2. freeze (server, once)
@@ -333,6 +370,10 @@ async def freeze(db, selection: dict) -> dict:
         raise ValueError("the selection has no traders")
     if selection.get("rules") != rules_dict():
         raise ValueError("this selection was made under different rules than the code now has")
+    scanned, unread = int(selection.get("scanned") or 0), int(selection.get("unread", 0))
+    if scanned == 0 or unread > MAX_UNREAD_SHARE * scanned:
+        raise ValueError(f"the scan could not read {unread} of {scanned} accounts (limit {MAX_UNREAD_SHARE:.0%}): "
+                         "it is incomplete, so its ranking is not fair. Run --select again")
     async with db.sessions() as s, s.begin():
         if await s.get(StateRow, SELECTION_KEY) is not None:
             raise RuntimeError("Track A's traders are already frozen; the selection cannot be changed")
