@@ -346,3 +346,129 @@ def test_server_vm_is_outside_the_us_and_backups_stay_free():
     s = (Path(__file__).parent.parent / "scripts" / "vm.sh").read_text()
     assert 'ZONE="${ZONE:-australia-southeast2-a}"' in s and 'BUCKET_REGION="us-central1"' in s
     assert "--boot-disk-size=10GB" in s and "us-central1-a" not in s
+
+
+# ------------------------------------------------------------------ brief outages: quiet retries, one alert, one all-clear
+async def last_event_id(e):
+    evs = await events_since(e)
+    return evs[-1].id if evs else 0
+
+
+async def events_since(e, after_id=0):
+    from sqlalchemy import select
+
+    async with e.db.sessions() as s:
+        return (await s.execute(select(EventRow).where(EventRow.id > after_id).order_by(EventRow.id))).scalars().all()
+
+
+def test_what_counts_as_a_brief_outage():
+    from tradeengine.alerting import is_transient
+    from tradeengine.brokers.base import BrokerError
+    from tradeengine.brokers.binance import _check
+
+    req = httpx.Request("GET", "https://demo-api.binance.com/api/v3/account")
+    for code in (502, 504):
+        with pytest.raises(BrokerError) as e:
+            _check(httpx.Response(code, request=req), "/api/v3/account")
+        assert is_transient(e.value)
+    with pytest.raises(BrokerError) as e:  # Binance refusing the server's country is NOT brief
+        _check(httpx.Response(451, request=req), "/api/v3/time")
+    assert not is_transient(e.value)
+    assert is_transient(httpx.ConnectError("x")) and is_transient(httpx.ReadTimeout("x")) and is_transient(TimeoutError())
+    assert not is_transient(BrokerError("insufficient balance")) and not is_transient(ValueError("bug"))
+
+
+async def test_outage_is_quiet_for_3_minutes_then_one_alert_then_one_all_clear(eng):
+    from tradeengine.alerting import FailureAlerts
+    from tradeengine.brokers.base import BrokerError
+
+    t = [datetime(2026, 11, 17, 7, 48, tzinfo=UTC)]
+    a = FailureAlerts(eng.db, eng.settings_store, clock=lambda: t[0])
+    start = await last_event_id(eng)
+    err = BrokerError("Binance /api/v3/account server error 502", status=502, retryable=True)
+
+    await a.failed("account refresh", err)  # 07:48
+    await a.succeeded("account refresh")  # 07:49 back: nothing at all reaches Telegram
+    assert await events_since(eng, start) == []
+
+    for minute in range(5):  # 07:50 .. 07:54, failing every minute
+        t[0] = datetime(2026, 11, 17, 7, 50 + minute, tzinfo=UTC)
+        await a.failed("account refresh", err)
+    evs = await events_since(eng, start)
+    assert [(e.level, e.message) for e in evs] == [
+        ("ERROR", "account refresh failing for 3 min (4 tries): Binance /api/v3/account server error 502")]  # once
+    t[0] = datetime(2026, 11, 17, 7, 57, tzinfo=UTC)
+    await a.succeeded("account refresh")
+    evs = await events_since(eng, start)
+    assert evs[-1].level == "INFO" and evs[-1].message == "Recovered: account refresh working again after 7 min"
+    assert worth_sending(evs[-1]) and format_event(evs[-1]) == "✅ engine: account refresh working again after 7 min"
+    assert format_event(evs[0]) == "❗ ERROR engine: account refresh failing for 3 min (4 tries): Binance /api/v3/account server error 502"
+
+    await a.failed("account refresh", ValueError("a real bug"))  # not an outage: alerts at once
+    assert (await events_since(eng, start))[-1].message == "account refresh failed: a real bug"
+
+
+async def test_alert_delay_is_an_admin_setting(eng):
+    from tradeengine.alerting import FailureAlerts
+    from tradeengine.brokers.base import BrokerError
+
+    await eng.settings_store.update({"transient_alert_minutes": 0}, "t")
+    a = FailureAlerts(eng.db, eng.settings_store)
+    start = await last_event_id(eng)
+    await a.failed("reconcile", BrokerError("binance: Binance /api/v3/account server error 504", retryable=True))
+    assert (await events_since(eng, start))[-1].message.startswith("reconcile failing for under a minute (1 tries)")
+
+
+async def test_reconcile_outage_is_retried_quietly_but_real_findings_alert_with_details(eng):
+    from tradeengine.brokers.base import BrokerError
+    from tradeengine.reconciler import ReconcileReport
+
+    adapter = eng.adapters[Venue.BINANCE]
+    orig = adapter.list_positions
+
+    async def down():
+        raise BrokerError("Binance /api/v3/openOrders server error 502", status=502, retryable=True)
+
+    adapter.list_positions = down
+    start = await last_event_id(eng)
+    with pytest.raises(BrokerError) as e:  # handed to the quiet-retry rule, no reconciler warning
+        await eng._reconcile()
+    assert e.value.retryable and "binance: Binance /api/v3/openOrders server error 502" in str(e.value)
+    assert await events_since(eng, start) == []
+    adapter.list_positions = orig
+    await eng._reconcile()  # reachable again: clean pass, nothing logged
+    assert await events_since(eng, start) == []
+
+    rep = ReconcileReport(reprotected=["BTC/USDT te-abc"], external=["ETH/USDT 123"], errors=["binance: bad request"])
+    assert rep.describe() == ("stop re-placed: BTC/USDT te-abc; position the engine did not open: ETH/USDT 123; "
+                              "errors: binance: bad request")
+
+
+async def test_hourly_run_retries_a_brief_outage_inside_the_hour(eng, monkeypatch):
+    from tradeengine import runner as runner_mod
+    from tradeengine.brokers.base import BrokerError
+
+    monkeypatch.setattr(runner_mod, "HOURLY_RETRY_SECONDS", 0)
+    r = runner_mod.StrategyRunner(eng)
+    calls = []
+
+    async def flaky(now):
+        calls.append(now)
+        if len(calls) < 3:
+            raise BrokerError("Binance /api/v3/klines server error 502", retryable=True)
+
+    r.on_hour = flaky
+    start = await last_event_id(eng)
+    await r.run_hour()
+    assert len(calls) == 3 and await events_since(eng, start) == []  # recovered on the 3rd try, quietly
+
+    calls.clear()
+
+    async def broken(now):
+        calls.append(now)
+        raise ValueError("bug")
+
+    r.on_hour = broken
+    await r.run_hour()
+    assert len(calls) == 1  # a real error is not retried...
+    assert (await events_since(eng, start))[-1].message == "hourly run failed: bug"  # ...and alerts at once

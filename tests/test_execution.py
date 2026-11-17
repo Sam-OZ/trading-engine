@@ -174,4 +174,12 @@ async def test_one_venue_failing_does_not_stop_the_other(db, state, fake):
     ex = ExecutionService(db, {Venue.CAPITAL: fake, Venue.BINANCE: Broken(Venue.BINANCE)}, state, recheck_delay=0)
     await ex.submit(plan())
     rep = await Reconciler(db, {Venue.CAPITAL: fake, Venue.BINANCE: Broken(Venue.BINANCE)}, ex).run_once()
-    assert rep.matched == 1 and rep.errors
+    # a broker outage (retryable) is reported separately and retried quietly; it is not a reconcile finding
+    assert rep.matched == 1 and rep.transient == ["binance: down"] and not rep.errors and rep.clean
+
+    class Wrong(FakeAdapter):
+        async def list_positions(self):
+            raise BrokerError("bad request")
+
+    rep = await Reconciler(db, {Venue.CAPITAL: fake, Venue.BINANCE: Wrong(Venue.BINANCE)}, ex).run_once()
+    assert rep.matched == 1 and rep.errors == ["binance: bad request"] and not rep.transient and not rep.clean

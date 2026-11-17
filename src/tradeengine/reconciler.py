@@ -19,6 +19,7 @@ from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select
 
+from .alerting import is_transient
 from .brokers.base import BrokerAdapter
 from .db import Database, OrderRow, PositionRow
 from .execution import ExecutionService, journal_to_broker
@@ -48,10 +49,25 @@ class ReconcileReport:
     external: list[str] = field(default_factory=list)
     orders_settled: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    transient: list[str] = field(default_factory=list)  # venue not reachable (brief outage): retried quietly
 
     @property
     def clean(self) -> bool:
         return not (self.reprotected or self.force_closed or self.external or self.errors)
+
+    def describe(self) -> str:
+        """The findings in one line for the alert (the full report stays in the event's data)."""
+        parts = []
+        for label, items in (
+            ("stop re-placed", self.reprotected),
+            ("closed because no stop could be placed", self.force_closed),
+            ("position the engine did not open", self.external),
+            ("errors", self.errors),
+        ):
+            if items:
+                parts.append(f"{label}: {', '.join(items)}")
+        text = "; ".join(parts)
+        return text if len(text) <= 600 else text[:597] + "..."
 
 
 class Reconciler:
@@ -74,10 +90,14 @@ class Reconciler:
             try:
                 await self._venue(venue, adapter, report)
             except Exception as e:  # one venue failing must not stop the other
-                report.errors.append(f"{venue}: {e}")
-                log.exception("reconcile failed for %s", venue)
+                if is_transient(e):
+                    report.transient.append(f"{venue.value}: {e}")
+                    log.warning("reconcile could not reach %s: %s", venue.value, e)
+                else:
+                    report.errors.append(f"{venue.value}: {e}")
+                    log.exception("reconcile failed for %s", venue)
         if not report.clean:
-            await log_event(self.db, "WARNING", "reconciler", "Reconcile found issues", report.__dict__)
+            await log_event(self.db, "WARNING", "reconciler", f"Reconcile found issues: {report.describe()}", report.__dict__)
         return report
 
     async def _venue(self, venue: Venue, adapter: BrokerAdapter, report: ReconcileReport) -> None:

@@ -41,6 +41,9 @@ class RuntimeSettings(BaseModel):
     telegram_chat_id: str | None = None  # set by `tradeengine telegram-setup`; not a secret (the bot token is)
     telegram_summary_utc: str = Field("00:30", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")  # 08:30 Perth, after the 00:00 UTC daily close
     telegram_repeat_hours: float = Field(6.0, ge=0, le=72)  # the same warning text is sent at most once per this many hours
+    # A brief broker outage (HTTP 5xx, rate limit, timeout) is retried quietly; Telegram is told only when the
+    # same job has kept failing this long (0 = at once), and again when it recovers.
+    transient_alert_minutes: float = Field(3.0, ge=0, le=120)
 
     # --- Strategies (all OFF until they pass Gate 2; set with `tradeengine gate2-apply`) ---
     strategies_enabled: dict[str, list[str]] = {}  # strategy -> symbols it may trade

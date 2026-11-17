@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 
+from .alerting import FailureAlerts, is_transient
 from .brokers.base import BrokerAdapter, BrokerError
 from .brokers.binance import BinanceSpotDemoAdapter
 from .brokers.capital import CapitalComAdapter
@@ -64,6 +65,7 @@ class Engine:
         self.db = Database(cfg.database_url)
         self.state = EngineState(self.db, cfg.kill_switch_file)
         self.settings_store = SettingsStore(self.db)
+        self.alerts = FailureAlerts(self.db, self.settings_store)
         self.instruments = instruments or DEFAULT_INSTRUMENTS
         self.adapters: dict[Venue, BrokerAdapter] = adapters if adapters is not None else self._build_adapters()
         self.execution = ExecutionService(self.db, self.adapters, self.state)
@@ -190,9 +192,9 @@ class Engine:
         settings = await self.settings_store.load()
         for venue, a in self.adapters.items():
             self._tasks.append(asyncio.create_task(self._consume(venue, a), name=f"stream-{venue}"))
-        self._tasks.append(asyncio.create_task(self._loop(self.reconciler.run_once, settings.reconcile_interval_seconds), name="reconcile"))
-        self._tasks.append(asyncio.create_task(self._loop(self.refresh_accounts, 60), name="equity"))
-        self._tasks.append(asyncio.create_task(self._loop(self._heartbeat, 15), name="heartbeat"))
+        self._tasks.append(asyncio.create_task(self._loop(self._reconcile, settings.reconcile_interval_seconds, "reconcile"), name="reconcile"))
+        self._tasks.append(asyncio.create_task(self._loop(self.refresh_accounts, 60, "account refresh"), name="equity"))
+        self._tasks.append(asyncio.create_task(self._loop(self._heartbeat, 15, "heartbeat"), name="heartbeat"))
         self._tasks.append(asyncio.create_task(StrategyRunner(self).run_forever(), name="strategies"))
         if self.cfg.telegram_bot_token is not None:
             from .notify import TelegramNotifier
@@ -217,16 +219,28 @@ class Engine:
         else:
             self.bars.add(ev)
 
-    async def _loop(self, fn, every: float) -> None:
+    async def _loop(self, fn, every: float, job: str) -> None:
+        """Run a job forever. A brief broker outage is retried quietly on the next pass; Telegram hears only
+        if it lasts (see alerting.py). Any other failure alerts at once."""
         while True:
             try:
                 await fn()
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                log.exception("%s failed", getattr(fn, "__name__", fn))
-                await log_event(self.db, "ERROR", "engine", f"{getattr(fn, '__name__', 'task')} failed: {e}")
+                if not is_transient(e):
+                    log.exception("%s failed", job)
+                await self.alerts.failed(job, e)
+            else:
+                await self.alerts.succeeded(job)
             await asyncio.sleep(every)
+
+    async def _reconcile(self) -> None:
+        """One reconcile pass. Real findings were already alerted by the reconciler; a venue it could not
+        reach because of a brief outage is raised here so the quiet-retry rule applies to it."""
+        report = await self.reconciler.run_once()
+        if report.transient:
+            raise BrokerError("; ".join(report.transient), retryable=True)
 
     async def _heartbeat(self) -> None:
         (self.cfg.data_dir / "HEARTBEAT").write_text(datetime.now(UTC).isoformat())

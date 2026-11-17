@@ -29,6 +29,7 @@ import httpx
 import pandas as pd
 from sqlalchemy import select
 
+from .alerting import is_transient
 from .db import PositionMetaRow, PositionRow
 from .execution import journal_to_broker
 from .history import (
@@ -63,6 +64,8 @@ HISTORY_DAYS = 1100
 REFRESH_DAYS = 3  # after the first load, only the last few days are fetched each hour
 SEED_RECENT_DAYS = 14  # Capital.com recent bars appended to the local file at the first load
 MAX_GAP = pd.Timedelta(days=4)  # longer than any weekend + holiday: a real hole in the data
+HOURLY_RETRIES = 5  # brief outage at the top of the hour: retry this many times...
+HOURLY_RETRY_SECONDS = 60  # ...this far apart (well inside the signal's first hour)
 MAX_DATA_AGE = pd.Timedelta(hours=2)  # act on a signal only while the hourly data is current
 GRACE_SECONDS = 20
 
@@ -103,13 +106,28 @@ class StrategyRunner:
             now = datetime.now(UTC)
             next_hour = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
             await asyncio.sleep((next_hour - now).total_seconds() + GRACE_SECONDS)
+            await self.run_hour()
+
+    async def run_hour(self) -> None:
+        """One hourly pass. A brief broker outage is retried every minute for a few minutes, so a one-minute
+        blip at 00:00 UTC does not cost the day's decision; the signal is still inside its first hour. Safe to
+        repeat: order ids are fixed per signal (the journal blocks a duplicate), the strategy's own holding is
+        checked before entry, and trailing stops only ever tighten."""
+        for attempt in range(HOURLY_RETRIES + 1):
             try:
                 await self.on_hour(datetime.now(UTC))
             except asyncio.CancelledError:
                 raise
             except Exception as ex:
-                log.exception("strategy runner failed")
-                await log_event(self.e.db, "ERROR", "runner", f"Hourly run failed: {ex}")
+                if not is_transient(ex):
+                    log.exception("strategy runner failed")
+                await self.e.alerts.failed("hourly run", ex, component="runner")
+                if not is_transient(ex) or attempt == HOURLY_RETRIES:
+                    return
+                await asyncio.sleep(HOURLY_RETRY_SECONDS)
+            else:
+                await self.e.alerts.succeeded("hourly run", component="runner")
+                return
 
     async def _seed_from_file(self, inst, now: datetime) -> pd.DataFrame:
         """Forex/gold: local hourly history + Capital.com's recent bars, with any gap filled from Dukascopy."""

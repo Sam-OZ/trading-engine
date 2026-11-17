@@ -20,6 +20,7 @@ from decimal import Decimal
 import httpx
 from sqlalchemy import func, select
 
+from .alerting import RECOVERED
 from .db import EventRow, PositionRow, StateRow
 from .models import PositionStatus
 
@@ -47,6 +48,8 @@ def worth_sending(ev: EventRow) -> bool:
         return True
     if ev.level == "WARNING":
         return ev.component in WARN_COMPONENTS
+    if ev.message.startswith(RECOVERED):  # the all-clear after an outage that was alerted
+        return True
     return ev.component == "execution" and ev.message.startswith(("Opened", "Closed"))
 
 
@@ -54,6 +57,8 @@ def format_event(ev: EventRow) -> str:
     if ev.component == "execution" and ev.level == "INFO":
         icon = "🟢" if ev.message.startswith("Opened") else "🔵"
         return f"{icon} {ev.message}"
+    if ev.message.startswith(RECOVERED):
+        return f"✅ {ev.component}: {ev.message.removeprefix(RECOVERED)}"
     return f"{ICON.get(ev.level, '')} {ev.level} {ev.component}: {ev.message}".strip()
 
 
