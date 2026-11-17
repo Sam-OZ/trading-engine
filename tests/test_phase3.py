@@ -472,3 +472,51 @@ async def test_hourly_run_retries_a_brief_outage_inside_the_hour(eng, monkeypatc
     await r.run_hour()
     assert len(calls) == 1  # a real error is not retried...
     assert (await events_since(eng, start))[-1].message == "hourly run failed: bug"  # ...and alerts at once
+
+
+async def test_start_up_waits_out_a_broker_outage_with_telegram_running(tmp_path):
+    from tradeengine.brokers.base import BrokerError
+
+    cfg = InfraConfig(_env_file=None, database_url=f"sqlite+aiosqlite:///{tmp_path / 'e.db'}", data_dir=tmp_path,
+                      kill_switch_file=tmp_path / "KILL", telegram_bot_token="123:abc")
+    fake = FakeAdapter(Venue.BINANCE, "USDT")
+    tries = []
+    real_connect = fake.connect
+
+    async def connect():
+        tries.append(1)
+        if len(tries) <= 3:
+            raise BrokerError("Binance /api/v3/time server error 502", status=502, retryable=True)
+        await real_connect()
+
+    fake.connect = connect
+    e = Engine(cfg, adapters={Venue.BINANCE: fake})
+    await e.db.create_all()
+    await e.settings_store.update({"transient_alert_minutes": 0}, "t")
+    await e.start_with_retry(every=0)
+    assert len(tries) == 4 and e._notifier_started  # alerts were running throughout the wait
+    msgs = [ev.message for ev in await events_since(e)]
+    assert msgs[-2].startswith("engine start failing for under a minute (1 tries): Binance /api/v3/time server error 502")
+    assert msgs[-1] == "Recovered: engine start working again after under a minute"
+    tasks = len(e._tasks)
+    e.start_notifier()  # run_forever calls it again: still one notifier
+    assert len(e._tasks) == tasks
+    await e.stop()
+
+
+def test_status_says_plainly_when_the_broker_is_down(tmp_path, monkeypatch, capsys):
+    from tradeengine import cli
+    from tradeengine.brokers.base import BrokerError
+
+    async def down(self):
+        raise BrokerError("Binance /api/v3/time server error 502", status=502, retryable=True)
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{tmp_path / 'e.db'}")
+    monkeypatch.setattr(cli, "_engine", lambda **kw: Engine(InfraConfig(_env_file=None,
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'e.db'}", data_dir=tmp_path, kill_switch_file=tmp_path / "KILL"),
+        adapters={Venue.BINANCE: FakeAdapter(Venue.BINANCE, "USDT")}))
+    monkeypatch.setattr(FakeAdapter, "connect", down)
+    with pytest.raises(SystemExit) as ex:
+        cli.main(["status"])
+    assert "not reachable right now" in str(ex.value) and "502" in str(ex.value)

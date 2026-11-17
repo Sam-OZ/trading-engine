@@ -77,6 +77,7 @@ class Engine:
         self.accounts: dict[Venue, AccountSnapshot] = {}
         self.unavailable: dict[str, str] = {}  # symbol -> why the broker would not serve it at start-up
         self._tasks: list[asyncio.Task] = []
+        self._notifier_started = False
 
     def _build_adapters(self) -> dict[Venue, BrokerAdapter]:
         insts = list(self.instruments.values())
@@ -188,6 +189,39 @@ class Engine:
         available = max(Decimal(0), min(real.available, balance - committed))
         return AccountSnapshot(Venue.BINANCE, real.currency, balance, equity, available)
 
+    def start_notifier(self) -> None:
+        """Telegram alerts as a background task (once). Started before the brokers connect, so a failed start-up
+        reaches the phone too."""
+        if self._notifier_started or self.cfg.telegram_bot_token is None:
+            return
+        from .notify import TelegramNotifier
+
+        token = self.cfg.telegram_bot_token.get_secret_value()
+        self._tasks.append(asyncio.create_task(TelegramNotifier(self, token).run_forever(), name="telegram"))
+        self._notifier_started = True
+
+    async def start_with_retry(self, every: float = 30.0, every_hard: float = 300.0) -> None:
+        """start() for the 24/7 service. If a broker cannot be reached (maintenance, outage), keep retrying in this
+        process instead of crashing into a silent systemd restart loop: Telegram is already running, so a brief
+        outage stays quiet, a long one alerts after `transient_alert_minutes`, and recovery sends the all-clear.
+        Any other start-up error alerts at once and is retried every 5 minutes."""
+        await self.db.create_all()
+        self.start_notifier()
+        while True:
+            try:
+                await self.start()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                hard = not is_transient(e)
+                if hard:
+                    log.exception("engine start failed")
+                await self.alerts.failed("engine start", e)
+                await asyncio.sleep(every_hard if hard else every)
+            else:
+                await self.alerts.succeeded("engine start")
+                return
+
     async def run_forever(self) -> None:
         settings = await self.settings_store.load()
         for venue, a in self.adapters.items():
@@ -196,11 +230,7 @@ class Engine:
         self._tasks.append(asyncio.create_task(self._loop(self.refresh_accounts, 60, "account refresh"), name="equity"))
         self._tasks.append(asyncio.create_task(self._loop(self._heartbeat, 15, "heartbeat"), name="heartbeat"))
         self._tasks.append(asyncio.create_task(StrategyRunner(self).run_forever(), name="strategies"))
-        if self.cfg.telegram_bot_token is not None:
-            from .notify import TelegramNotifier
-
-            token = self.cfg.telegram_bot_token.get_secret_value()
-            self._tasks.append(asyncio.create_task(TelegramNotifier(self, token).run_forever(), name="telegram"))
+        self.start_notifier()
         await log_event(self.db, "INFO", "engine", "Engine started", {"venues": [v.value for v in self.adapters]})
         await asyncio.gather(*self._tasks)
 

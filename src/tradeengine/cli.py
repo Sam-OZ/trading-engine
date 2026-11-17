@@ -61,9 +61,17 @@ def _engine(need_brokers: bool = True) -> Engine:
 
 
 async def cmd_status(_args) -> None:
+    from .alerting import is_transient
+
     eng = _engine()
     try:
-        await eng.start()
+        try:
+            await eng.start()
+        except Exception as e:
+            if not is_transient(e):
+                raise
+            sys.exit(f"Broker not reachable right now ({e}). The engine keeps retrying on its own; "
+                     "try `status` again later.")
         halted, why = await eng.state.is_halted()
         print(f"Kill switch: {'ENGAGED - ' + why if halted else 'off'}")
         for sym, why_not in eng.unavailable.items():
@@ -98,7 +106,7 @@ async def cmd_gate1(args) -> None:
 async def cmd_run(_args) -> None:
     eng = _engine()
     try:
-        await eng.start()
+        await eng.start_with_retry()  # a broker outage at start-up is waited out in-process, with Telegram alerts
         await eng.run_forever()
     finally:
         await eng.stop()
