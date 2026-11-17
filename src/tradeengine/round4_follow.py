@@ -4,8 +4,9 @@ the pre-registration, frozen once the selection is frozen.
 
 1. Select (once, on a desktop: the leaderboard is ~40 MB): traders on Hyperliquid's public leaderboard with
    an account >= $100k, profitable all-time and this month, >= 180 days old, at most 50 fills a day (no bots
-   or market makers), >= 100 closed trades and >= 90 days in the history Hyperliquid keeps, at least half
-   of all-time profit realised from trading (not funding / off-exchange hedges), and >= 70% of their volume
+   or market makers), >= 100 closed trades and >= 90 days in the history Hyperliquid keeps, a trade in the last
+   60 days, profitable over that same kept window with at least half of it realised from closed trades (not
+   funding or off-exchange hedges; compared over the SAME window, from Hyperliquid's P&L history), >= 70% of their volume
    in coins Binance futures lists with >= $100M a day. Best realised trading P&L first, up to 15.
 2. Freeze (once, on the server): the list is stored and never changed.
 3. Record (hourly, on the server, read-only): their open positions. A coin has a LONG consensus when at least
@@ -52,6 +53,7 @@ MAX_FILLS_PER_DAY = 50.0
 MIN_CLOSING_FILLS = 100
 MIN_SPAN_DAYS = 90.0
 MIN_REALISED_SHARE = 0.5
+MAX_IDLE_DAYS = 60
 MIN_COVERAGE = 0.7
 MIN_COIN_QUOTE_VOLUME = 100e6
 MAX_TRADERS = 15
@@ -81,7 +83,7 @@ SCORE_KEY = "round4_holdout:follow"
 
 
 FROZEN = ("MIN_ACCOUNT", "MIN_AGE_DAYS", "MAX_FILLS_PER_DAY", "MIN_CLOSING_FILLS", "MIN_SPAN_DAYS", "MIN_REALISED_SHARE",
-          "MIN_COVERAGE", "MIN_COIN_QUOTE_VOLUME", "MAX_TRADERS", "MAX_SCAN", "CONSENSUS_IN", "CONSENSUS_HOLD",
+          "MAX_IDLE_DAYS", "MIN_COVERAGE", "MIN_COIN_QUOTE_VOLUME", "MAX_TRADERS", "MAX_SCAN", "CONSENSUS_IN", "CONSENSUS_HOLD",
           "MIN_POSITION_SHARE", "RISK_PCT", "STOP_ATR", "ATR_DAYS", "FEE_RATE", "SLIPPAGE_BPS", "START_EQUITY", "MAX_OPEN",
           "MAX_LEVERAGE", "DAILY_LOSS_PCT", "MAX_DD_PCT", "MIN_RECORD_DAYS")
 
@@ -215,7 +217,14 @@ async def fill_history(hl: Hyperliquid, address: str) -> list[dict]:
     return fills
 
 
-def assess(c: dict, fills: list[dict], first_seen_ms: int | None, liquid: dict[str, str], now: datetime) -> list[str]:
+def pnl_at(history: list, t_ms: int) -> float | None:
+    """Cumulative P&L at time t from Hyperliquid's [[ms, pnl], ...] history (last point at or before t)."""
+    before = [float(v) for ts, v in history if int(ts) <= t_ms]
+    return before[-1] if before else (float(history[0][1]) if history else None)
+
+
+def assess(c: dict, fills: list[dict], first_seen_ms: int | None, liquid: dict[str, str], now: datetime,
+           pnl_history: list | None = None) -> list[str]:
     """Why a candidate does NOT qualify (empty = qualifies). Fills c with the numbers used."""
     why = []
     age = (now.timestamp() * 1000 - first_seen_ms) / 86_400_000 if first_seen_ms else 0
@@ -232,17 +241,28 @@ def assess(c: dict, fills: list[dict], first_seen_ms: int | None, liquid: dict[s
         vol[f["coin"]] = vol.get(f["coin"], 0.0) + float(f["sz"]) * float(f["px"])
     total = sum(vol.values()) or 1.0
     covered = sum(v for coin, v in vol.items() if (binance_base(coin) or "") in liquid)
+    # profit over the SAME window the fills cover (all-time P&L would compare years of profit with months of fills)
+    hist = pnl_history or []
+    start, end = pnl_at(hist, int(fills[0]["time"])), (float(hist[-1][1]) if hist else None)
+    window_pnl = (end - start) if start is not None and end is not None else None
+    idle = (now.timestamp() * 1000 - fills[-1]["time"]) / 86_400_000
     c.update({"fills": len(fills), "span_days": round(span, 1), "fills_per_day": round(len(fills) / span, 1),
-              "closing_fills": len(closing), "realised_pnl": round(realised, 2),
-              "realised_share": round(realised / c["pnl_all"], 3) if c["pnl_all"] else 0.0, "coverage": round(covered / total, 3)})
+              "closing_fills": len(closing), "realised_pnl": round(realised, 2), "idle_days": round(idle, 1),
+              "window_pnl": None if window_pnl is None else round(window_pnl, 2),
+              "realised_share": round(realised / window_pnl, 3) if window_pnl and window_pnl > 0 else 0.0,
+              "coverage": round(covered / total, 3)})
     if c["fills_per_day"] > MAX_FILLS_PER_DAY:
         why.append(f"{c['fills_per_day']} fills a day")
     if len(closing) < MIN_CLOSING_FILLS:
         why.append(f"{len(closing)} closed trades")
     if span < MIN_SPAN_DAYS:
         why.append(f"{span:.0f} days of history")
-    if c["realised_share"] < MIN_REALISED_SHARE:
-        why.append(f"realised trading P&L only {c['realised_share']:.0%} of all-time")
+    if idle > MAX_IDLE_DAYS:
+        why.append(f"no trade for {idle:.0f} days")
+    if window_pnl is None or window_pnl <= 0:
+        why.append("not profitable over its kept history")
+    elif c["realised_share"] < MIN_REALISED_SHARE:
+        why.append(f"realised trading P&L only {c['realised_share']:.0%} of its profit over the same window")
     if c["coverage"] < MIN_COVERAGE:
         why.append(f"only {c['coverage']:.0%} of volume in coins Binance futures lists")
     return why
@@ -252,7 +272,8 @@ def _category(reason: str) -> str:
     for needle, label in (("days old", "account too new"), ("fills a day", "too many fills a day"),
                           ("closed trades", "too few closed trades"), ("days of history", "history too short"),
                           ("realised", "profit mostly not from trading"), ("volume in coins", "coins Binance futures does not list"),
-                          ("no fills", "no fills kept"), ("error", "could not be read")):
+                          ("no fills", "no fills kept"), ("no trade for", "inactive"),
+                          ("not profitable over", "lost money over its kept history"), ("error", "could not be read")):
         if needle in reason:
             return label
     return reason
@@ -283,8 +304,9 @@ async def select_traders(hl: Hyperliquid, market: FuturesMarket, now: datetime |
                 rejected["bot or market maker"] = rejected.get("bot or market maker", 0) + 1
                 continue
             pf = await hl.info({"type": "portfolio", "user": c["address"]})
-            first = next((d.get("accountValueHistory") or [[None]] for n, d in pf if n == "allTime"), [[None]])[0][0]
-            why = assess(c, await fill_history(hl, c["address"]), first, liquid, now)
+            all_time = next((d for n, d in pf if n == "allTime"), {})
+            first = (all_time.get("accountValueHistory") or [[None]])[0][0]
+            why = assess(c, await fill_history(hl, c["address"]), first, liquid, now, all_time.get("pnlHistory") or [])
         except Exception as e:  # one unreadable account must not stop the scan
             why = [f"error {type(e).__name__}"]
         if why:

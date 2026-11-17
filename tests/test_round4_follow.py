@@ -38,12 +38,13 @@ async def eng(tmp_path):
 
 
 class FakeHL:
-    def __init__(self, book=None, leaderboard=None, fills=None, recent=None, first_seen=None):
+    def __init__(self, book=None, leaderboard=None, fills=None, recent=None, first_seen=None, pnl=None):
         self.book = book or {}
         self.rows = leaderboard or []
         self.fills = fills or {}
         self.recent = recent or {}
         self.first_seen = first_seen or {}
+        self.pnl = pnl or {}
 
     async def positions(self, address):
         return self.book.get(address, (0.0, {}))
@@ -54,7 +55,7 @@ class FakeHL:
     async def info(self, body):
         a = body["user"]
         if body["type"] == "portfolio":
-            return [["allTime", {"accountValueHistory": [[self.first_seen.get(a, 0), "1"]]}]]
+            return [["allTime", {"accountValueHistory": [[self.first_seen.get(a, 0), "1"]], "pnlHistory": self.pnl.get(a, [])}]]
         if body["type"] == "userFillsByTime":
             if body["startTime"] > 0:
                 return self.recent.get(a, [])
@@ -91,8 +92,12 @@ def row(addr, acct, pnl_all, pnl_month, name=None):
                                    ["allTime", {"pnl": str(pnl_all), "roi": "0", "vlm": "0"}]]}
 
 
-def fills(n, days, coin="BTC", pnl_each=1000.0, start_ms=1_700_000_000_000):
+NOW_MS = int(datetime(2026, 11, 17, tzinfo=UTC).timestamp() * 1000)
+
+
+def fills(n, days, coin="BTC", pnl_each=1000.0, ends_days_ago=1):
     step = days * DAY_MS / max(n - 1, 1)
+    start_ms = NOW_MS - (days + ends_days_ago) * DAY_MS
     return [{"coin": coin, "px": "100", "sz": "1", "time": int(start_ms + i * step), "closedPnl": str(pnl_each if i % 2 else 0)}
             for i in range(n)]
 
@@ -118,25 +123,34 @@ def test_coin_mapping_and_consensus_counts_only_meaningful_positions_in_listed_c
     assert r4f.still_on("SELL", 0, 2) and not r4f.still_on("SELL", 1, 3)
 
 
-async def test_selection_skips_bots_new_accounts_and_hedged_profit_and_ranks_by_realised_pnl():
+def window(gain, days=400):
+    """P&L history: flat until `days` ago, then `gain` by now."""
+    return [[NOW_MS - days * DAY_MS, "100000"], [NOW_MS - 1, str(100000 + gain)]]
+
+
+async def test_selection_skips_bots_new_idle_losing_and_hedged_accounts_and_ranks_by_realised_pnl():
     now = datetime(2026, 11, 17, tzinfo=UTC)
     old = int((now - timedelta(days=400)).timestamp() * 1000)
     hl = FakeHL(
         leaderboard=[row("bot", 5e6, 9e8, 1e6), row("good1", 2e6, 3e6, 1e5, "Ann"), row("good2", 9e5, 2e6, 5e4),
                      row("new", 1e6, 1e6, 1e4), row("hedged", 3e6, 5e8, 1e6), row("tiny", 5e4, 1e6, 1e4),
-                     row("loser", 1e6, 1e6, -5)],
+                     row("loser", 1e6, 1e6, -5), row("idle", 1e6, 1.5e6, 1e4), row("red", 1e6, 1.4e6, 1e4)],
         recent={"bot": [{}] * 2000},
         fills={"good1": fills(400, 300, pnl_each=8000), "good2": fills(300, 200, coin="kPEPE", pnl_each=9000),
-               "new": fills(300, 150), "hedged": fills(300, 200, pnl_each=10)},
-        first_seen={"good1": old, "good2": old, "hedged": old, "new": int((now - timedelta(days=60)).timestamp() * 1000)},
+               "new": fills(300, 150), "hedged": fills(300, 200, pnl_each=10),
+               "idle": fills(300, 200, ends_days_ago=100), "red": fills(300, 200)},
+        first_seen={a: old for a in ("good1", "good2", "hedged", "idle", "red")} | {"new": int((now - timedelta(days=60)).timestamp() * 1000)},
+        pnl={"good1": window(2.5e6), "good2": window(2.0e6), "hedged": window(4e8), "idle": window(1e6), "red": window(-2e5)},
     )
     sel = await r4f.select_traders(hl, FakeMarket(), now=now, progress=lambda m: None)
     assert [t["address"] for t in sel["traders"]] == ["good1", "good2"]  # most realised trading profit first
     g1, g2 = sel["traders"]
     assert g1["realised_pnl"] == 1_600_000 and g2["realised_pnl"] == 1_350_000
     assert g1["coverage"] == 1.0 and g2["coverage"] == 1.0  # kPEPE trades as 1000PEPE on Binance
-    assert sel["rejected"] == {"bot or market maker": 1, "account too new": 1, "profit mostly not from trading": 1}
-    assert sel["scanned"] == 5 and sel["rules"] == r4f.rules_dict()  # "tiny" and "loser" never even scanned
+    assert g1["realised_share"] == pytest.approx(1.6e6 / 2.5e6) and g1["window_pnl"] == pytest.approx(2.5e6)
+    assert sel["rejected"] == {"bot or market maker": 1, "account too new": 1, "profit mostly not from trading": 1,
+                               "inactive": 1, "lost money over its kept history": 1}
+    assert sel["scanned"] == 7 and sel["rules"] == r4f.rules_dict()  # "tiny" and "loser" never even scanned
 
 
 # ------------------------------------------------------------------ freeze
