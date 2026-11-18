@@ -22,6 +22,9 @@
   round4-follow --select                 round 4 Track A: pick the traders to follow (desktop; writes a JSON file)
   round4-follow --freeze <selection.json>  store that selection on the server, once; the shadow record starts
   round4-follow --status | --score       Track A shadow tally; the one-look score (after 90 days and 40 trades)
+  round5 --download                      round 5: Binance BTC/ETH perpetual candles + funding history (no keys)
+  round5 --dev                           round 5: development look, C2's short side (Mar 2020 - Oct 2023)
+  round5 --holdout                       round 5: the one unseen look (Nov 2023 - Oct 2026), after a development PASS
 """
 
 from __future__ import annotations
@@ -366,6 +369,31 @@ async def cmd_round3(args) -> None:
     await _cmd_round(args, 3)
 
 
+async def cmd_round5(args) -> None:
+    """Round 5: C2's short side on Binance USDⓈ-M perpetuals (pre-registered in round5.py)."""
+    from . import round5 as r5
+
+    cfg = load_config()
+    if args.download:
+        await r5.download(cfg.data_dir)
+        return
+    eng = _engine(need_brokers=False)
+    try:
+        await eng.db.create_all()
+        settings = await eng.settings_store.load()
+        if args.dev:
+            ok, out = await r5.dev(cfg.data_dir, settings, eng.db)
+        else:
+            print("UNSEEN LOOK: one look, ever, at Nov 2023 - Oct 2026. The result is locked once shown.")
+            if not args.yes and input("Type HOLDOUT to run it now: ").strip() != "HOLDOUT":
+                sys.exit("Not run.")
+            ok, out = await r5.holdout(cfg.data_dir, settings, eng.db)
+        print((out / "report.md").read_text())
+        print(f"Report folder: {out}")
+    finally:
+        await eng.stop()
+
+
 async def cmd_round4_follow(args) -> None:
     """Round 4 Track A: select (desktop), freeze (server, once), status, score (once)."""
     from . import round4_follow as r4f
@@ -649,6 +677,12 @@ def main(argv: list[str] | None = None) -> None:
     mode3.add_argument("--dev", action="store_true", help="crypto development run (check 1)")
     mode3.add_argument("--holdout", metavar="DEV_RESULT_JSON", help="the one crypto holdout run (check 2)")
     r3p.add_argument("--yes", action="store_true", help="skip the HOLDOUT confirmation")
+    r5 = sub.add_parser("round5")
+    mode5 = r5.add_mutually_exclusive_group(required=True)
+    mode5.add_argument("--download", action="store_true", help="futures candles and funding history (resumable)")
+    mode5.add_argument("--dev", action="store_true", help="the development look")
+    mode5.add_argument("--holdout", action="store_true", help="the one unseen look")
+    r5.add_argument("--yes", action="store_true", help="skip the HOLDOUT confirmation")
     r4f = sub.add_parser("round4-follow")
     mode4f = r4f.add_mutually_exclusive_group(required=True)
     mode4f.add_argument("--select", action="store_true", help="pick the traders (desktop; ~1 hour, read-only)")
@@ -686,6 +720,7 @@ def main(argv: list[str] | None = None) -> None:
         "round3": cmd_round3,
         "round4-kronos": cmd_round4_kronos,
         "round4-follow": cmd_round4_follow,
+        "round5": cmd_round5,
         "telegram-setup": cmd_telegram_setup,
         "telegram-test": cmd_telegram_test,
         "gate2-apply": cmd_gate2_apply,

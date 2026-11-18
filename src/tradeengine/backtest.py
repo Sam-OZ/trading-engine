@@ -74,6 +74,10 @@ DEFAULT_COSTS: dict[str, CostModel] = {
     "XAU/USD": CostModel(spread=0.60, slippage=0.10, funding_annual=0.06),
     "BTC/USDT": CostModel(spread_bps=1.0, slippage_bps=2.0, commission_rate=0.001),
     "ETH/USDT": CostModel(spread_bps=1.5, slippage_bps=2.0, commission_rate=0.001),
+    # Round 5 (17 Nov 2026): Binance USDⓈ-M perpetuals, regular taker fee 0.05% a side; funding is the real
+    # 8-hourly history (Leg.funding), not a flat rate.
+    "BTC/USDT-PERP": CostModel(spread_bps=1.0, slippage_bps=2.0, commission_rate=0.0005),
+    "ETH/USDT-PERP": CostModel(spread_bps=1.5, slippage_bps=2.0, commission_rate=0.0005),
     "SOL/USDT": CostModel(spread_bps=3.0, slippage_bps=4.0, commission_rate=0.001),
 }
 
@@ -115,6 +119,7 @@ class Trade:
     costs: float
     bars: int
     reason: str
+    funding: float = 0.0  # perpetual futures: funding paid (+) or received (-), included in costs and pnl
 
 
 def params_id(p: dict) -> str:

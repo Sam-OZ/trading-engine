@@ -109,6 +109,9 @@ class Leg:
     frames: dict[str, pd.DataFrame]
     schedule: list[tuple[pd.Timestamp, pd.Timestamp, dict | None]]
     prep_of: object = None  # callable(params) -> key into frames
+    # Perpetual futures (round 5): the exchange's real funding rate at each funding time (index UTC, value as a
+    # fraction of notional). Longs pay a positive rate, shorts receive it; a negative rate the other way round.
+    funding: pd.Series | None = None
 
     @property
     def allow_short(self) -> bool:
@@ -164,6 +167,7 @@ class _Pos:
     bars: int = 0
     best: float = 0.0
     funding: float = 0.0
+    fund_mark: int = 0  # ns: funding payments after this instant are still to be applied
 
 
 def simulate(
@@ -190,6 +194,11 @@ def simulate(
                 raise ValueError(f"{leg.symbol}: prepared frames disagree on bar times ({k})")
             cols_cache[(leg.symbol, k)] = columns(f)
         index[leg.symbol] = idx if idx is not None else pd.DatetimeIndex([], tz="UTC")
+    fund_arr: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    for leg in legs:
+        if leg.funding is not None:
+            f = leg.funding.dropna().sort_index()
+            fund_arr[leg.symbol] = (f.index.as_unit("ns").asi8, f.to_numpy(dtype=float))
 
     def key_of(leg: Leg, p: dict) -> str:
         return leg.prep_of(p)
@@ -230,7 +239,7 @@ def simulate(
         acct[leg.venue].cash += pnl
         trades.append(Trade(leg.symbol, strategy.name, p.pid, p.side.value, str(p.time), str(t), p.entry, price, p.stop0, p.target,
                             p.units, p.risk, pnl, pnl / p.risk if p.risk else 0.0, commission + p.entry_commission + p.funding,
-                            p.bars, reason))
+                            p.bars, reason, funding=p.funding))
         pos[leg.symbol] = None
 
     def open_positions() -> list[tuple[Leg, _Pos]]:
@@ -292,7 +301,7 @@ def simulate(
         pos[leg.symbol] = _Pos(
             sig.side, entry, sig.stop, sig.stop, sig.target, units, risk, t, i, sig.trail_atr, sig.breakeven_at_r, sig.max_bars,
             sig.trail_activate_r, abs(entry - sig.stop), params, params_id(params), sig.reason, units * unit_notional,
-            leg.cost.commission_rate * units * entry * conv, t.normalize(), best=entry,
+            leg.cost.commission_rate * units * entry * conv, t.normalize(), best=entry, fund_mark=pd.Timestamp(t).value,
         )
 
     def mark(t: pd.Timestamp) -> None:
@@ -335,6 +344,15 @@ def simulate(
                 if d > p.day:
                     p.funding += p.units * o * q2u(leg, t, o) * leg.cost.funding_annual / 365.0 * (d - p.day).days
                     p.day = d
+            # perpetual-futures funding paid or received since the last bar (a payment at the entry instant is not
+            # held; one at an exit at this bar's open is: the live engine trades after the 00:00 UTC funding)
+            if p is not None and sym in fund_arr:
+                ft, fv = fund_arr[sym]
+                t_ns = pd.Timestamp(t).value
+                a, b = np.searchsorted(ft, p.fund_mark, side="right"), np.searchsorted(ft, t_ns, side="right")
+                if b > a:
+                    p.funding += p.side.sign * float(fv[a:b].sum()) * p.units * o * q2u(leg, t, o)
+                p.fund_mark = max(p.fund_mark, t_ns)
             # signal exit decided at the previous close
             if p is not None and pending_exit[sym]:
                 half, slip = leg.cost.half_spread(o), leg.cost.slip(o)
