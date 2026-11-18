@@ -130,6 +130,29 @@ def test_incomplete_data_is_refused(tmp_path):
         r5.load_perps(tmp_path)
 
 
+def _write_funding(data_dir, sym, times):
+    p = r5.funding_path(data_dir, sym)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    pd.Series(0.0001, index=times, name="rate").rename_axis("time").to_csv(p)
+
+
+def test_funding_that_starts_after_listing_but_before_the_test_is_complete(data_dir):
+    # Binance's real BTCUSDT record: listed 8 Sep 2019, first funding payment 10 Sep 2019 08:00 (seen 18 Nov 2026).
+    end = pd.Timestamp("2026-11-18", tz="UTC")
+    _write_funding(data_dir, "BTC/USDT-PERP", pd.date_range(pd.Timestamp("2019-09-10 08:00", tz="UTC"), end, freq="8h"))
+    assert set(r5.load_perps(data_dir)) == set(r5.PERPS)
+
+    _write_funding(data_dir, "BTC/USDT-PERP", pd.date_range(pd.Timestamp("2020-03-02", tz="UTC"), end, freq="8h"))
+    with pytest.raises(SystemExit, match=r"BTC/USDT-PERP: funding starts 2020-03-02 00:00, after the test starts"):
+        r5.load_perps(data_dir)
+
+    times = pd.date_range(pd.Timestamp("2019-09-10 08:00", tz="UTC"), end, freq="8h")
+    hole_from, hole_to = pd.Timestamp("2022-05-01", tz="UTC"), pd.Timestamp("2022-05-03", tz="UTC")
+    _write_funding(data_dir, "BTC/USDT-PERP", times[(times < hole_from) | (times > hole_to)])
+    with pytest.raises(SystemExit, match="gap in the funding payments"):
+        r5.load_perps(data_dir)
+
+
 # ------------------------------------------------------------------ the two looks, in order
 @pytest.fixture(scope="module")
 def market():

@@ -179,9 +179,9 @@ class PerpData:
 
 def load_perps(data_dir: Path) -> dict[str, PerpData]:
     """Both perpetuals up to HOLDOUT_END, refusing anything incomplete: a late start, a gap over 4 days in the
-    candles, or funding missing for more than a day while the contract traded."""
+    candles, funding that starts after DEV_FROM or ends early, or funding missing for more than a day."""
     out, problems = {}, []
-    for sym, (fsym, _) in PERPS.items():
+    for sym in PERPS:
         h1 = read_frame(history_path(data_dir, SOURCE, sym, "H1"))
         fr = read_funding(funding_path(data_dir, sym))
         if h1 is None or fr is None or h1.empty or fr.empty:
@@ -196,9 +196,15 @@ def load_perps(data_dir: Path) -> dict[str, PerpData]:
         gap = h1.index.to_series().diff().max()
         if gap > pd.Timedelta(days=4):
             problems.append(f"{sym}: a {gap} gap in the candles")
+        # Funding only matters while a trade can be open (from DEV_FROM). Binance's own record starts a little after
+        # listing (BTCUSDT: listed 8 Sep 2019, first payment 10 Sep 08:00), which is complete, not missing.
         fgap = fr.index.to_series().diff().max()
-        if fgap > pd.Timedelta(days=1) or fr.index[0] > LISTED[fsym] + pd.Timedelta(days=2) or fr.index[-1] < HOLDOUT_END - pd.Timedelta(hours=9):
-            problems.append(f"{sym}: funding history incomplete (largest gap {fgap}, {fr.index[0]:%Y-%m-%d} to {fr.index[-1]:%Y-%m-%d})")
+        if fr.index[0] > DEV_FROM:
+            problems.append(f"{sym}: funding starts {fr.index[0]:%Y-%m-%d %H:%M}, after the test starts ({DEV_FROM:%Y-%m-%d})")
+        if fr.index[-1] < HOLDOUT_END - pd.Timedelta(hours=9):
+            problems.append(f"{sym}: funding ends {fr.index[-1]:%Y-%m-%d %H:%M}; download again")
+        if fgap > pd.Timedelta(days=1):
+            problems.append(f"{sym}: a {fgap} gap in the funding payments")
         out[sym] = PerpData(h1, fr, f"{sym}: {len(h1):,} hourly candles {h1.index[0]:%Y-%m-%d} to {h1.index[-1]:%Y-%m-%d}; "
                                     f"{len(fr):,} funding payments, average {fr.mean() * 3 * 365:+.1%} a year")
     if problems:
