@@ -431,6 +431,10 @@ async def cmd_round4_follow(args) -> None:
             sys.exit("Track A has no frozen selection yet (round4-follow --select on your Mac, then vm.sh follow-freeze).")
         if args.status:
             print(r4f.summary_line(st))
+            lines = await r4f.open_trade_lines(eng.db)
+            if lines:
+                print("Open shadow trades (recorded only, never sent):")
+                print("\n".join(lines))
             print(f"Recorded for {st.days:.1f} days; the score needs {r4f.MIN_RECORD_DAYS} days and {r4f.RULES.holdout_min_trades} closed trades.")
             return
         try:

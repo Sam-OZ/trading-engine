@@ -336,3 +336,46 @@ async def test_unread_accounts_get_a_second_pass_and_an_incomplete_scan_cannot_b
     with pytest.raises(ValueError, match="could not read 1 of 3 accounts"):  # 33% unread: not a fair ranking
         await r4f.freeze(eng.db, json.loads(json.dumps(sel)))
     assert await r4f.load_selection(eng.db) is None
+
+
+async def test_status_lists_open_shadow_trades_only(eng):
+    async with eng.db.sessions() as s, s.begin():
+        s.add(ShadowTradeRow(coin="BTC", symbol="BTCUSDT", side="SELL", opened_at=datetime(2026, 11, 18, 6, 0, tzinfo=UTC),
+                             entry=Decimal("64612.3"), stop=Decimal("67100"), size=Decimal("0.01"), risk_usd=Decimal("25"),
+                             reason="0 long / 4 short of 15 followed"))
+        s.add(ShadowTradeRow(coin="kPEPE", symbol="1000PEPEUSDT", side="BUY", opened_at=datetime(2026, 11, 18, 7, 0, tzinfo=UTC),
+                             entry=Decimal("0.0081234"), stop=Decimal("0.0072"), size=Decimal("1000"), risk_usd=Decimal("24.5"),
+                             reason="3 long / 0 short of 15 followed"))
+        s.add(ShadowTradeRow(coin="ETH", symbol="ETHUSDT", side="BUY", opened_at=T0 - timedelta(days=2), entry=Decimal("1"),
+                             stop=Decimal("0.5"), size=Decimal("1"), risk_usd=Decimal("25"), reason="x",
+                             closed_at=T0 - timedelta(days=1), exit=Decimal("1"), exit_reason="stop", pnl=Decimal("0"), r=0))
+    lines = await r4f.open_trade_lines(eng.db)
+    assert len(lines) == 2  # the closed ETH trade is not listed
+    assert lines[0].split()[:2] == ["SHORT", "BTC"] and "opened 18 Nov 06:00 UTC (14:00 Perth)" in lines[0]
+    assert "entry 64,612.30  stop 67,100.00  risk 25.00 USDT  [0 long / 4 short of 15 followed]" in lines[0]
+    assert lines[1].split()[:2] == ["LONG", "kPEPE"] and "entry 0.0081234  stop 0.0072" in lines[1]
+
+
+
+def test_status_command_prints_the_open_trades(monkeypatch, capsys, tmp_path):
+    from test_round2 import _cli_env
+
+    from tradeengine.cli import main as cli_main
+
+    _cli_env(monkeypatch, tmp_path)
+    sel = tmp_path / "sel.json"
+    sel.write_text(json.dumps(selection(["a", "b", "c"])))
+    cli_main(["round4-follow", "--freeze", str(sel)])
+    capsys.readouterr()
+    cli_main(["round4-follow", "--status"])
+    out = capsys.readouterr().out
+    assert "0 open" in out and "Open shadow trades" not in out  # nothing listed when nothing is open
+
+    async def two_open(db):
+        return ["  SHORT BTC ...", "  LONG  ETH ..."]
+
+    monkeypatch.setattr(r4f, "open_trade_lines", two_open)
+    cli_main(["round4-follow", "--status"])
+    out = capsys.readouterr().out.splitlines()
+    k = out.index("Open shadow trades (recorded only, never sent):")
+    assert out[k + 1:k + 3] == ["  SHORT BTC ...", "  LONG  ETH ..."] and out[k + 3].startswith("Recorded for")

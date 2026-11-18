@@ -638,6 +638,27 @@ def summary_line(st: FollowStats) -> str:
             f"profit factor {pf}, drawdown {st.max_dd_pct:.1f}%" + (" - STOPPED at 10% drawdown" if st.killed else ""))
 
 
+PERTH = timedelta(hours=8)  # Australia/Perth has no daylight saving
+
+
+def _price(x) -> str:
+    v = float(x)
+    return f"{v:,.2f}" if abs(v) >= 1 else f"{v:.6g}"
+
+
+async def open_trade_lines(db) -> list[str]:
+    """One line per open shadow trade, oldest first, from the recorded rows only (read-only, no prices fetched)."""
+    async with db.sessions() as s:
+        rows = (await s.execute(select(ShadowTradeRow).where(ShadowTradeRow.closed_at.is_(None))
+                                .order_by(ShadowTradeRow.opened_at, ShadowTradeRow.id))).scalars().all()
+    out = []
+    for t in rows:
+        at = _utc(t.opened_at)
+        out.append(f"  {'LONG' if t.side == 'BUY' else 'SHORT':<5} {t.coin:<8} opened {at:%d %b %H:%M} UTC ({at + PERTH:%H:%M} Perth)  "
+                   f"entry {_price(t.entry)}  stop {_price(t.stop)}  risk {float(t.risk_usd):.2f} USDT  [{t.reason}]")
+    return out
+
+
 def judge(st: FollowStats) -> tuple[bool, list[str]]:
     why = []
     if st.killed or st.max_dd_pct >= RULES.holdout_max_dd_pct:
